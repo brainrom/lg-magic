@@ -146,6 +146,7 @@ static const struct {
 	{ 0x808B, KEY_VOICECOMMAND },
 	{ 0x807C, KEY_HOME },
 	{ 0x8043, KEY_SETUP },
+	{ 0x804C, KEY_LIST }, // List button on MR19
 	{ 0x8028, KEY_BACK },
 	{ 0x80AB, KEY_PROGRAM },
 	{ 0x805D, KEY_MEDIA }, // IVI
