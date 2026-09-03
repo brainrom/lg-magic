@@ -73,33 +73,41 @@ static const struct {
 	{ 0x8016, KEY_6 }, { 0x8017, KEY_7 }, { 0x8018, KEY_8 }, { 0x8019, KEY_9 },
 	{ LGMAGIC_CODE_WHEEL, KEY_ENTER },
 	{ LGMAGIC_CODE_WHEEL, BTN_LEFT },
-	{ 0x8053, KEY_LIST },
-	{ 0x8045, KEY_MENU }, // ... button
-	{ 0x8002, KEY_VOLUMEUP },
-	{ 0x8003, KEY_VOLUMEDOWN },
-	{ 0x8009, KEY_MUTE },
-	{ 0x808B, KEY_VOICECOMMAND },
-	{ 0x807C, KEY_HOME },
-	{ 0x8043, KEY_SETUP },
-	{ 0x804C, KEY_LIST }, // List button on MR19
-	{ 0x8028, KEY_BACK },
-	{ 0x80AB, KEY_PROGRAM },
-	{ 0x805D, KEY_MEDIA }, // IVI
-	{ 0x800B, KEY_TV },
-	{ 0x8098, KEY_CONTEXT_MENU }, // STB MENU
 	{ 0x8000, KEY_CHANNELUP },
 	{ 0x8001, KEY_CHANNELDOWN },
-	{ 0x8072, KEY_RED },
-	{ 0x8071, KEY_GREEN },
-	{ 0x8063, KEY_YELLOW },
-	{ 0x8061, KEY_BLUE },
-	{ 0x8081, KEY_VIDEO }, // MOVIES
-	{ 0x80B0, KEY_PLAY },
-	{ 0x80BA, KEY_PAUSE },
-	{ 0x8040, KEY_UP },
-	{ 0x8041, KEY_DOWN },
+	{ 0x8002, KEY_VOLUMEUP },
+	{ 0x8003, KEY_VOLUMEDOWN },
 	{ 0x8006, KEY_RIGHT },
 	{ 0x8007, KEY_LEFT },
+	{ 0x8009, KEY_MUTE },
+	{ 0x800B, KEY_TV },
+	{ 0x8024, KEY_F6 }, // YouTube
+	{ 0x8028, KEY_BACK },
+	{ 0x8029, KEY_FAVORITES }, // Heart button
+	{ 0x8031, KEY_F3 }, // Disney
+	{ 0x8040, KEY_UP },
+	{ 0x8041, KEY_DOWN },
+	{ 0x8043, KEY_SETUP },
+	{ 0x8045, KEY_MENU }, // ... button
+	{ 0x8048, KEY_F4 }, // LG Channels
+	{ 0x804C, KEY_LIST }, // List button on MR19
+	{ 0x8053, KEY_LIST },
+	{ 0x805D, KEY_MEDIA }, // IVI
+	{ 0x8056, KEY_F1 }, // Netflix
+	{ 0x805C, KEY_F2 }, // Amazon Prime
+	{ 0x8061, KEY_BLUE },
+	{ 0x8063, KEY_YELLOW },
+	{ 0x8071, KEY_GREEN },
+	{ 0x8072, KEY_RED },
+	{ 0x807B, KEY_F5 }, // News
+	{ 0x807C, KEY_HOME },
+	{ 0x8081, KEY_VIDEO }, // MOVIES
+	{ 0x8098, KEY_CONTEXT_MENU }, // STB MENU
+	{ 0x80A1, KEY_MEDIA }, // 'input'/home button
+	{ 0x80AB, KEY_PROGRAM },
+	{ 0x808B, KEY_VOICECOMMAND },
+	{ 0x80B0, KEY_PLAY },
+	{ 0x80BA, KEY_PAUSE },
 };
 
 static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
@@ -333,7 +341,8 @@ static void lgmagic_remove(struct hid_device *hdev)
 }
 
 static const struct hid_device_id lgmagic_devices[] = {
-	{ HID_BLUETOOTH_DEVICE(0x000f, 0x3412) }, // LG Magic Remote
+	{ HID_BLUETOOTH_DEVICE(0x000f, 0x3412) }, // LG Magic Remote MR19/MR20
+	{ HID_BLUETOOTH_DEVICE(0x005d, 0x8762) }, // LG Magic Remote MR26GA
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, lgmagic_devices);
