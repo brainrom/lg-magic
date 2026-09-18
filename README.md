@@ -38,10 +38,32 @@ This project provides a comprehensive Linux kernel driver and toolset for the LG
 
 ### Button Mapping
 Comprehensive button support including:
-- Power, number keys (0-9), navigation buttons (UP/DOWN/LEFT/RIGHT)
-- Media controls (PLAY, PAUSE, VOLUME, MUTE)
+- Number keys (0-9), navigation buttons (UP/DOWN/LEFT/RIGHT)
+- Media controls (PLAY, PAUSE, STOP, VOLUME, MUTE)
 - Color buttons (RED, GREEN, YELLOW, BLUE)
-- Special function buttons (HOME, BACK, SETTINGS, GUIDE)
+- Special function buttons (HOME, BACK, SETTINGS, GUIDE, INFO, LIST)
+- Regional and model specific keys the remote can emit (TEXT, SUBTITLE,
+  FAVORITES, ASPECT_RATIO, ZOOM, DATA, LANGUAGE, RADIO, RECENT, app shortcuts)
+
+The four in-band control codes `0x800A`, `0x800D` (voice stream start and stop)
+and `0x803E`, `0x803F` (motion start and stop) are not keys and are filtered
+out instead of being reported.
+
+#### POWER, and why `0x8000` is CHANNELUP
+
+Code `0x8000` is `KEY_CHANNELUP` in every LG TV key map from 2017 to 2023, and
+the MR18/MR19/MR20 key catalogue holds it exactly once. The remote's POWER
+button is an infrared-first key: it carries LG NEC address `0x20DF`, command
+`0x08`, and its catalogue record has no Bluetooth code at all. Measurements on
+an MR20 nevertheless show POWER transmitting `0x8000` as well, which the
+firmware can only explain through the remote's SRAM key handler, so the two
+buttons are indistinguishable on the Bluetooth wire.
+
+The driver therefore reports `0x8000` as `KEY_CHANNELUP`, with standby left on
+the secondary power key `0x8099` (`KEY_SLEEP`). Set `power_key=1` to report
+`KEY_POWER` instead if a stray channel change is the greater nuisance. A host
+with an infrared receiver can always tell the two apart, because only POWER
+emits NEC command `0x08`.
 
 ### Airmouse Functionality
 **Needs calibration before usage**
@@ -86,7 +108,8 @@ The driver supports several runtime parameters:
 
 ```bash
 # Load with custom parameters
-sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 imu_evdev=1 debug=2
+sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 imu_evdev=1 \
+              power_key=0 debug=2
 
 # Or set via sysfs after loading
 echo 1 > /sys/module/lg_magic/parameters/airmouse
@@ -98,6 +121,8 @@ echo 2 > /sys/module/lg_magic/parameters/debug
 - `airmouse` (0/1): Enable/disable airmouse functionality
 - `airmouse_threshold` (int): Gyro threshold for enabling airmouse (default: 300)
 - `imu_evdev` (0/1): Expose raw IMU data as separate input device
+- `power_key` (0/1): Report code `0x8000` as `KEY_POWER` instead of
+  `KEY_CHANNELUP` (default: 0)
 - `debug` (0-2): Debug message level (0=quiet, 1=normal, 2=verbose)
 
 ## Calibration System
@@ -208,13 +233,15 @@ python3 scripts/display_imu.py --calib calib.json --mouse
 
 ### HID Protocol Structure
 
-The remote uses report ID `0xFD` (30-byte total: 1 byte report ID + 29 bytes payload). The payload structure is:
+The remote uses report ID `0xFD`, 20 bytes in total: 1 byte report ID plus 19
+bytes of payload. The payload structure is:
 
 | Offset | Size | Description | Format |
 |--------|------|-------------|---------|
 | 0 | 1 | Report ID (0xFD) | uint8_t |
-| 1-2 | 2 | Packet counter | little-endian uint16 |
-| 3-4 | 2 | Constant value (0xFD00) | little-endian uint16 |
+| 1-2 | 2 | Packet counter, two separate bytes on the TV side | little-endian uint16 |
+| 3 | 1 | Bits 1:0 motion state (1 valid, 2 stopped), bits 7:2 a level field | uint8_t |
+| 4 | 1 | Status, meaning not established | uint8_t |
 | 5-6 | 2 | Gyro X | big-endian int16 |
 | 7-8 | 2 | Gyro Y | big-endian int16 |
 | 9-10 | 2 | Gyro Z | big-endian int16 |
@@ -224,7 +251,9 @@ The remote uses report ID `0xFD` (30-byte total: 1 byte report ID + 29 bytes pay
 | 17-18 | 2 | Button code | big-endian uint16 |
 | 19 | 1 | Wheel delta | int8 |
 
-Other report types (0xF9, 0x01) were not observed, maybe used for other functions (like MIC)
+While motion is valid the remote suppresses discrete button-down frames: every
+`0xFD` frame simply repeats the code of the key currently held, so the driver
+edge-detects on bytes 17-18 rather than trusting byte 3.
 
 ### IMU Data Processing
 - **Sampling rate**: ~50Hz (20ms intervals)
