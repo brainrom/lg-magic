@@ -43,6 +43,13 @@ Comprehensive button support including:
 - Color buttons (RED, GREEN, YELLOW, BLUE)
 - Special function buttons (HOME, BACK, SETTINGS, GUIDE)
 
+### Device Interrogation
+- Motion streaming is enabled when the remote connects with the vendor command
+  `F9 01`; an MR22 streams motion even without it
+- Firmware version, region zone and the remote's own sensor calibration blob
+  (SCD) are requested at probe and exposed through sysfs
+- Battery level is decoded from the upper six bits of report byte 3
+
 ### Airmouse Functionality
 **Needs calibration before usage**
 - Gyroscope-based pointer control
@@ -99,6 +106,25 @@ echo 2 > /sys/module/lg_magic/parameters/debug
 - `airmouse_threshold` (int): Gyro threshold for enabling airmouse (default: 300)
 - `imu_evdev` (0/1): Expose raw IMU data as separate input device
 - `debug` (0-2): Debug message level (0=quiet, 1=normal, 2=verbose)
+
+### Sysfs Attributes
+
+Under the HID device directory, for example
+`/sys/bus/hid/devices/0005:000F:3412.*/`:
+
+- `fw_version`: the firmware payload of the `F9 12` response as hex. It is
+  not text: an MR22 answers `02 02 28 34 23` followed by `ff` filler, and
+  the encoding of those five bytes is unknown, so they are passed through
+  untouched
+- `fw_major`: firmware version byte the TV uses to gate further commands
+- `fw_zone`: region zone byte
+- `battery_level`: 0-63, decoded from report byte 3
+- `scd`: the remote's sensor calibration blob as hex, empty until the remote
+  answers `F9 17`. The response arrives as 155-byte frames carrying a "more
+  follows" flag in byte 2 and the count of valid payload bytes in byte 3. The
+  remote reuses one transmit buffer, so the bytes past that count are the
+  previous frame and are dropped; an MR22 answers with 150 then 110 bytes.
+  The payload itself is passed through unparsed
 
 ## Calibration System
 
@@ -224,7 +250,28 @@ The remote uses report ID `0xFD` (30-byte total: 1 byte report ID + 29 bytes pay
 | 17-18 | 2 | Button code | big-endian uint16 |
 | 19 | 1 | Wheel delta | int8 |
 
-Other report types (0xF9, 0x01) were not observed, maybe used for other functions (like MIC)
+The remote declares no output report at all. It declares `0xF9` as a 30-byte
+input report and a 200-byte feature report (the vendor command channel),
+`0xFD` as a 30-byte input report (motion and buttons, 20 bytes are sent) and
+`0xFE` as a 124-byte input report (voice: report ID, a status byte, a
+big-endian 16-bit event code in the same code space as the button field, then
+120 bytes of audio as two 60-byte blocks).
+
+The vendor command channel `0xF9` carries a one-byte opcode after the report
+ID, sent as a two-byte SET_REPORT on the feature report. An output report is
+taken by the transport and then dropped by the remote, which declares none.
+The opcodes this project uses are `0x01` motion active, `0x03`/`0x04`/`0x05`
+voice start, stop and restart, `0x11` read firmware version and `0x17` read
+sensor calibration data. Motion is controlled by `0x01` motion active and
+`0x02` motion sleep. An LG TV issues them as its pointer is shown and hidden,
+driven by application and focus state, so the remote's motion engine sleeps
+while no pointer is on screen. The driver sends `0x01` once with the startup
+commands and never `0x02`. A command issued as probe
+ends is answered about half the time, so the driver repeats the startup
+commands once the remote's first report shows the link carrying traffic.
+Writing to the vendor GATT bank `d0ff` is a different matter entirely and
+must be avoided: writing `0x01` to characteristic `ffd1` reboots the remote
+into its DFU bootloader.
 
 ### IMU Data Processing
 - **Sampling rate**: ~50Hz (20ms intervals)
@@ -249,6 +296,20 @@ Other report types (0xF9, 0x01) were not observed, maybe used for other function
 - **Kernel versions**: 4.15+ (tested on 6.11)
 - **Python**: 3.6+
 - **Dependencies**: python-evdev for raw capture; numpy, scipy, pyqtgraph for display and calibration
+
+## Not Implemented
+
+Documented remote behaviour this project deliberately leaves alone:
+
+- The infrared transmitter and the UEI code-set commands (`0xF9` opcodes `0x50`
+  to `0x74`), which drive an external set-top box
+- `0xF9 0x19` remote information and `0xF9 0x90` liquid detection
+- Over-the-air firmware update over the `d0ff` GATT bank, which is one blind
+  write away from stranding the remote in its bootloader
+- Parsing the SCD blob into calibration values; the blob is exposed raw because
+  its layout is not published
+- The Broadcom generation (MR14 to MR16A), which is BR/EDR, identifies as
+  `0a5c:8502` and uses the incompatible 22-byte report `0xFA`
 
 ## Contributing
 
