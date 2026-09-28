@@ -19,3 +19,6 @@ __pycache__/
 
 # Host-side tests
 tests/test_airmouse_math
+
+# Voice bridge
+voice/lg-magic-voice

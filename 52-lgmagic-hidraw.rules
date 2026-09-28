@@ -1,0 +1,4 @@
+SUBSYSTEM=="hidraw", SUBSYSTEMS=="hid", DRIVERS=="lgmagic", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
+SUBSYSTEM=="input", KERNEL=="event*", SUBSYSTEMS=="hid", DRIVERS=="lgmagic", \
+    MODE="0660", GROUP="input", TAG+="uaccess"
