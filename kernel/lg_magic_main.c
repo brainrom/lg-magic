@@ -19,6 +19,9 @@
 #include <linux/input.h>
 #include <linux/firmware.h>
 #include <linux/errno.h>
+#include <linux/spinlock.h>
+#include <linux/sysfs.h>
+#include <linux/workqueue.h>
 
 #include "lg_magic_airmouse.h"
 
@@ -50,9 +53,25 @@ static int imu_evdev = 0;
 module_param(imu_evdev, int, 0644);
 MODULE_PARM_DESC(imu_evdev, "Expose raw IMU");
 
+#define LGMAGIC_SCD_MAX 512
+#define LGMAGIC_FW_VER_MAX 32
+
 struct lgmagic_drvdata {
 	struct input_dev *input_hid;
 	struct input_dev *input_imu;
+	struct hid_device *hdev;
+	struct work_struct startup;
+	bool started;
+
+	spinlock_t lock;
+	u8 fw_ver[LGMAGIC_FW_VER_MAX];
+	size_t fw_len;
+	u8 scd[LGMAGIC_SCD_MAX];
+	size_t scd_len;
+	bool scd_done;
+	u8 fw_major;
+	u8 fw_zone;
+	u8 battery;
 
 	u16 last_keycode;
 	u16 last_btncode;
@@ -60,6 +79,17 @@ struct lgmagic_drvdata {
 	int mode;
 	struct lg_magic_airmouse_calib calib;
 };
+
+#define LGMAGIC_REPORT_CMD 0xF9
+#define LGMAGIC_REPORT_VOICE 0xFE
+
+#define LGMAGIC_CMD_MOTION_ON 0x01
+#define LGMAGIC_CMD_FW_VER 0x11
+#define LGMAGIC_CMD_SCD 0x17
+
+#define LGMAGIC_RSP_FW_VER 0x12
+#define LGMAGIC_RSP_FW_VER_CK 0x14
+#define LGMAGIC_RSP_SCD 0x17
 
 #define LGMAGIC_CODE_WHEEL 0x8044
 
@@ -102,10 +132,94 @@ static const struct {
 	{ 0x8007, KEY_LEFT },
 };
 
+static int lgmagic_cmd_send(struct hid_device *hdev, u8 opcode)
+{
+	u8 buf[2] = { LGMAGIC_REPORT_CMD, opcode };
+	int ret;
+
+	ret = hid_hw_raw_request(hdev, buf[0], buf, sizeof(buf),
+				 HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+	if (ret == sizeof(buf))
+		return 0;
+
+	lgmagic_dev_warn(&hdev->dev, "Command %02x rejected: %d", opcode, ret);
+
+	return ret < 0 ? ret : -EIO;
+}
+
+static void lgmagic_fw_version(struct hid_device *hdev, u8 *data, int size)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
+	unsigned long flags;
+	size_t len;
+
+	if (size < 4)
+		return;
+
+	len = min_t(size_t, size - 4, LGMAGIC_FW_VER_MAX);
+
+	spin_lock_irqsave(&drvdata->lock, flags);
+	drvdata->fw_major = data[2];
+	drvdata->fw_zone = data[3];
+	memcpy(drvdata->fw_ver, data + 4, len);
+	drvdata->fw_len = len;
+	spin_unlock_irqrestore(&drvdata->lock, flags);
+
+	lgmagic_dev_info(&hdev->dev, "Remote firmware %u zone %u: %*ph", data[2],
+			 data[3], (int)len, data + 4);
+}
+
+/* The remote reuses one transmit buffer, so everything past data[3] bytes
+ * is the previous frame and must not be stored.
+ */
+static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
+	unsigned long flags;
+	size_t len;
+
+	if (size < 4)
+		return;
+
+	len = min_t(size_t, data[3], size - 4);
+
+	spin_lock_irqsave(&drvdata->lock, flags);
+	if (drvdata->scd_done)
+		drvdata->scd_len = 0;
+	drvdata->scd_done = !data[2];
+	len = min_t(size_t, len, LGMAGIC_SCD_MAX - drvdata->scd_len);
+	memcpy(drvdata->scd + drvdata->scd_len, data + 4, len);
+	drvdata->scd_len += len;
+	spin_unlock_irqrestore(&drvdata->lock, flags);
+
+	lgmagic_dev_dbg(&hdev->dev, "SCD %zu bytes, more %u", len, data[2]);
+}
+
+static void lgmagic_cmd_response(struct hid_device *hdev, u8 *data, int size)
+{
+	if (size < 2)
+		return;
+
+	switch (data[1]) {
+	case LGMAGIC_RSP_FW_VER:
+	case LGMAGIC_RSP_FW_VER_CK:
+		lgmagic_fw_version(hdev, data, size);
+		break;
+	case LGMAGIC_RSP_SCD:
+		lgmagic_scd_chunk(hdev, data, size);
+		break;
+	default:
+		lgmagic_dev_dbg(&hdev->dev, "Command response %02x, %d bytes",
+				data[1], size);
+		break;
+	}
+}
+
 static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 				u8 *data, int size)
 {
 	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
+	unsigned long flags;
 	u8 reporting = 0;
 	u16 counter;
 	s16 imu[6];
@@ -119,6 +233,20 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 		return 0;
 	}
 
+	if (!drvdata->started) {
+		drvdata->started = true;
+		schedule_work(&drvdata->startup);
+	}
+
+	if (size >= 1 && data[0] == LGMAGIC_REPORT_CMD)
+	{
+		lgmagic_cmd_response(hdev, data, size);
+		return 0;
+	}
+
+	if (size >= 1 && data[0] == LGMAGIC_REPORT_VOICE)
+		return 0;
+
 	if (size != 20 || data[0] != 0xFD)
 	{
 		lgmagic_dev_warn(&hdev->dev, "Unknown descriptor with size %d and type %x", size, data[0]);
@@ -131,6 +259,10 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 
 	/* Parse counter (little-endian) */
 	counter = data[1] | (data[2] << 8);
+
+	spin_lock_irqsave(&drvdata->lock, flags);
+	drvdata->battery = data[3] >> 2;
+	spin_unlock_irqrestore(&drvdata->lock, flags);
 
 	/* Parse 6 signed 16-bit values, big-endian */
 	for (i = 0; i < 6; i++) {
@@ -214,6 +346,120 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 	return 0;
 }
 
+static ssize_t fw_version_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+	u8 fw_ver[LGMAGIC_FW_VER_MAX];
+	unsigned long flags;
+	size_t len, i;
+	int at = 0;
+
+	spin_lock_irqsave(&drvdata->lock, flags);
+	len = drvdata->fw_len;
+	memcpy(fw_ver, drvdata->fw_ver, len);
+	spin_unlock_irqrestore(&drvdata->lock, flags);
+
+	for (i = 0; i < len; i++)
+		at += sysfs_emit_at(buf, at, "%02x", fw_ver[i]);
+
+	return at + sysfs_emit_at(buf, at, "\n");
+}
+static DEVICE_ATTR_RO(fw_version);
+
+static ssize_t lgmagic_u8_show(struct lgmagic_drvdata *drvdata,
+			       const u8 *field, char *buf)
+{
+	unsigned long flags;
+	u8 val;
+
+	spin_lock_irqsave(&drvdata->lock, flags);
+	val = *field;
+	spin_unlock_irqrestore(&drvdata->lock, flags);
+
+	return sysfs_emit(buf, "%u\n", val);
+}
+
+static ssize_t fw_major_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return lgmagic_u8_show(drvdata, &drvdata->fw_major, buf);
+}
+static DEVICE_ATTR_RO(fw_major);
+
+static ssize_t fw_zone_show(struct device *dev, struct device_attribute *attr,
+			    char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return lgmagic_u8_show(drvdata, &drvdata->fw_zone, buf);
+}
+static DEVICE_ATTR_RO(fw_zone);
+
+static ssize_t battery_level_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return lgmagic_u8_show(drvdata, &drvdata->battery, buf);
+}
+static DEVICE_ATTR_RO(battery_level);
+
+static ssize_t scd_show(struct device *dev, struct device_attribute *attr,
+			char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+	u8 scd[LGMAGIC_SCD_MAX];
+	unsigned long flags;
+	size_t len, i;
+	int at = 0;
+
+	spin_lock_irqsave(&drvdata->lock, flags);
+	len = drvdata->scd_len;
+	memcpy(scd, drvdata->scd, len);
+	spin_unlock_irqrestore(&drvdata->lock, flags);
+
+	for (i = 0; i < len; i++)
+		at += sysfs_emit_at(buf, at, "%02x", scd[i]);
+
+	return at + sysfs_emit_at(buf, at, "\n");
+}
+static DEVICE_ATTR_RO(scd);
+
+static struct attribute *lgmagic_attrs[] = {
+	&dev_attr_fw_version.attr,
+	&dev_attr_fw_major.attr,
+	&dev_attr_fw_zone.attr,
+	&dev_attr_battery_level.attr,
+	&dev_attr_scd.attr,
+	NULL
+};
+
+static const struct attribute_group lgmagic_group = {
+	.attrs = lgmagic_attrs,
+};
+
+static void lgmagic_startup_commands(struct hid_device *hdev)
+{
+	lgmagic_cmd_send(hdev, LGMAGIC_CMD_FW_VER);
+	lgmagic_cmd_send(hdev, LGMAGIC_CMD_SCD);
+	lgmagic_cmd_send(hdev, LGMAGIC_CMD_MOTION_ON);
+}
+
+/* A command issued as probe ends is answered about half the time. The
+ * remote's first report proves the link carries traffic, so repeat there.
+ */
+static void lgmagic_startup_work(struct work_struct *work)
+{
+	struct lgmagic_drvdata *drvdata;
+
+	drvdata = container_of(work, struct lgmagic_drvdata, startup);
+
+	lgmagic_startup_commands(drvdata->hdev);
+}
+
 static void lgmagic_sanitize_mac(const char *uniq, char *out)
 {
 	size_t i = 0;
@@ -266,6 +512,9 @@ static int lgmagic_probe(struct hid_device *hdev, const struct hid_device_id *id
 		return -ENOMEM;
 
 	hid_set_drvdata(hdev, drvdata);
+	drvdata->hdev = hdev;
+	INIT_WORK(&drvdata->startup, lgmagic_startup_work);
+	spin_lock_init(&drvdata->lock);
 
 	ret = hid_parse(hdev);
 	if (ret)
@@ -334,11 +583,20 @@ loaded:
 			return ret;
 	}
 
+	ret = devm_device_add_group(&hdev->dev, &lgmagic_group);
+	if (ret)
+		return ret;
+
+	lgmagic_startup_commands(hdev);
+
 	return 0;
 }
 
 static void lgmagic_remove(struct hid_device *hdev)
 {
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
+
+	cancel_work_sync(&drvdata->startup);
 	hid_hw_stop(hdev);
 }
 
