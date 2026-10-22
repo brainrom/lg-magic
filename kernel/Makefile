@@ -7,6 +7,7 @@ KVER ?= $(shell uname -r)
 PWD  := $(shell pwd)
 
 CFLAGS_lg_magic_airmouse.o += $(CC_FLAGS_FPU)
+ccflags-remove-y += -mgeneral-regs-only
 
 all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
