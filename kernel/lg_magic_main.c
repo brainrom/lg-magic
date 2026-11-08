@@ -230,18 +230,25 @@ static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagi
 	const struct firmware *fw;
 
 	ret = request_firmware(&fw, fwname, dev);
-	if (ret == 0 && fw->size>=sizeof(struct lg_magic_airmouse_calib)) {
-		lgmagic_dev_info(dev, "Loading LG Magic calibration");
-		memcpy(&drvdata->calib, fw->data, sizeof(struct lg_magic_airmouse_calib));
+	if (ret)
+		return ret;
+
+	if (fw->size < sizeof(struct lg_magic_airmouse_calib)) {
 		release_firmware(fw);
-		if (lgmagic_validate_calib(&drvdata->calib))
-		{
-			lgmagic_dev_warn(dev, "Calibration table isn't valid. Airmouse disabled");
-			memset(&drvdata->calib, 0, sizeof(struct lg_magic_airmouse_calib));
-			return 0;
-		}
+		return 0;
 	}
-	return ret;
+
+	lgmagic_dev_info(dev, "Loading LG Magic calibration");
+	memcpy(&drvdata->calib, fw->data, sizeof(struct lg_magic_airmouse_calib));
+	release_firmware(fw);
+	if (lgmagic_validate_calib(&drvdata->calib))
+	{
+		lgmagic_dev_warn(dev, "Calibration table isn't valid. Airmouse disabled");
+		memset(&drvdata->calib, 0, sizeof(struct lg_magic_airmouse_calib));
+		return 0;
+	}
+
+	return 0;
 }
 
 static int lgmagic_probe(struct hid_device *hdev, const struct hid_device_id *id)
