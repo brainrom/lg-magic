@@ -1,0 +1,12 @@
+[Unit]
+Description=LG Magic Remote microphone bridge
+Wants=pipewire.service
+After=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/lg-magic-voice
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
