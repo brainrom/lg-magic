@@ -3,6 +3,7 @@ import numpy as np
 import csv
 import json
 import argparse
+import sys
 
 # -----------------------------
 # Load samples CSV
@@ -13,7 +14,7 @@ def load_imu_csv(filename):
     with open(filename, newline='') as f:
         reader = csv.reader(f)
         for row in reader:
-            if len(row) < 6:
+            if len(row) < 8:
                 continue
             try:
                 a.append([float(row[2]), float(row[3]), float(row[4])])
@@ -22,7 +23,7 @@ def load_imu_csv(filename):
                 continue  # skip invalid lines
     return np.array(a), np.array(g)
 
-def save_calibration_json(bias=[], matrix=[], gyro_bias=[0,0,0], filename):
+def save_calibration_json(filename, bias=[], matrix=[], gyro_bias=[0,0,0]):
     bias_list = [float(f"{v:.6f}") for v in bias]
     matrix_list = [[float(f"{v:.6f}") for v in row] for row in matrix]
     calib_dict = {
@@ -92,10 +93,10 @@ def main():
         accel_samples, gyro_samples = load_imu_csv(args.csv_file)
         if args.accel:
             b_calib, M_calib = calibrate_accel(accel_samples)
-            save_calibration_json(b_calib, M_calib, filename=args.output_file)
+            save_calibration_json(args.output_file, b_calib, M_calib)
         elif args.gyro:
             g_bias = calibrate_gyro_bias(gyro_samples)
-            save_calibration_json(gyro_bias=g_bias, filename=args.output_file)
+            save_calibration_json(args.output_file, gyro_bias=g_bias)
         else:
             print("You need to select --accel or --gyro")
     except Exception as e:

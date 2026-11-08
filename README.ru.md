@@ -20,6 +20,8 @@
 
 ### Инструменты Python
 
+- **scripts/capture_imu.py** - Запись сырых данных IMU для калибровки (требует только python-evdev)
+- **scripts/imu_reader.py** - Общий модуль чтения evdev для записи и отображения
 - **scripts/lg_magic.py** - Низкоуровневый анализатор пакетов. Изначальный инструмент, сохранен для истории
 - **scripts/calibrate.py** - Утилита калибровки IMU
 - **scripts/convert_calib.py** - Конвертер калибровки в бинарный формат для модуля ядра
@@ -106,18 +108,18 @@ echo 2 > /sys/module/lg_magic/parameters/debug
 
 ### Создание файлов калибровки
 
-1. **Сбор данных IMU для обеих калибровок:**
+1. **Сбор данных IMU:**
 ```bash
-python3 display_imu.py --csv samples.csv
+python3 scripts/capture_imu.py samples.csv
 ```
 
 2. **Вычисление калибровочных значений:**
 ```bash
 # Калибровка акселерометра (медленно вращайте по всем осям во время сбора данных)
-python3 calibrate.py --accel samples.csv calib_accel.json
+python3 scripts/calibrate.py --accel samples.csv calib_accel.json
 
 # Калибровка гироскопа (держите пульт неподвижно во время сбора данных)
-python3 calibrate.py --gyro samples.csv calib_gyro.json
+python3 scripts/calibrate.py --gyro samples.csv calib_gyro.json
 
 # Объединение JSON
 Объедините разделы gyro/accel. Настройте коэффициент гироскопа. Выходит за рамки этого проекта, рекомендуемое значение около 0.07
@@ -125,7 +127,7 @@ python3 calibrate.py --gyro samples.csv calib_gyro.json
 
 3. **Конвертация в бинарный формат:**
 ```bash
-python3 convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
+python3 scripts/convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
 ```
 
 ### Параметры калибровки
@@ -142,19 +144,25 @@ python3 convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
 python3 lg_magic.py
 ```
 
+### capture_imu.py - Запись сырых данных
+```bash
+# Сырые данные IMU для калибровки (требуется только python-evdev)
+python3 scripts/capture_imu.py samples.csv
+```
+
 ### display_imu.py - Визуализация IMU
 ```bash
 # Отображение сырых данных IMU
-python3 display_imu.py
+python3 scripts/display_imu.py
 
 # AHRS
-python3 display_imu.py --calib calib.json --ahrs
+python3 scripts/display_imu.py --calib calib.json --ahrs
 
 # 3D куб
-python3 display_imu.py --calib calib.json --cube
+python3 scripts/display_imu.py --calib calib.json --cube
 
 # Аэромышь через uinput
-python3 display_imu.py --calib calib.json --mouse
+python3 scripts/display_imu.py --calib calib.json --mouse
 ```
 
 ### Отладка аэромыши
@@ -165,7 +173,7 @@ python3 display_imu.py --calib calib.json --mouse
 sudo modprobe uinput
 
 # Запуск аэромыши
-python3 display_imu.py --calib calib.json --mouse
+python3 scripts/display_imu.py --calib calib.json --mouse
 ```
 
 ## Технические детали
@@ -212,7 +220,7 @@ python3 display_imu.py --calib calib.json --mouse
 - **Протестировано с**: LG Magic Remote MR20
 - **Версии ядра**: 4.15+ (тестировалось на 6.11)
 - **Python**: 3.6+
-- **Зависимости**: numpy, scipy, pyqtgraph, python-evdev
+- **Зависимости**: python-evdev для записи сырых данных; numpy, scipy, pyqtgraph для отображения и калибровки
 
 ## Участие в разработке
 

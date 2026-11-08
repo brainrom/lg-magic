@@ -20,6 +20,8 @@ This project provides a comprehensive Linux kernel driver and toolset for the LG
 
 ### Python Tools
 
+- **scripts/capture_imu.py** - Raw IMU capture for calibration (requires only python-evdev)
+- **scripts/imu_reader.py** - Shared evdev reader for capture and display
 - **scripts/lg_magic.py** - HIDRAW-level packet analyzer and debug tool. Initial tool, kept for historical reasons
 - **scripts/calibrate.py** - IMU calibration utility (accelerometer and gyroscope)
 - **scripts/convert_calib.py** - Converts JSON calibration to binary format for kernel module
@@ -106,18 +108,18 @@ The driver loads calibration data from binary files via Linux Firmware subsystem
 
 ### Creating Calibration Files
 
-1. **Collect IMU samples for both calibrations:**
+1. **Collect IMU samples:**
 ```bash
-python3 display_imu.py --csv samples.csv
+python3 scripts/capture_imu.py samples.csv
 ```
 
 2. **Calculate calibration values:**
 ```bash
 # Calibrate accelerometer (slowly rotate across all axes while collecting)
-python3 calibrate.py --accel samples.csv calib_accel.json
+python3 scripts/calibrate.py --accel samples.csv calib_accel.json
 
 # Calibrate gyroscope (keep remote stationary while collecting)
-python3 calibrate.py --gyro samples.csv calib_gyro.json
+python3 scripts/calibrate.py --gyro samples.csv calib_gyro.json
 
 # Combine Gyro/Accel JSONs
 Combine gyro/accel sections. Adjust gyro scale. Out of scope of this project, recommended value about 0.07
@@ -126,7 +128,7 @@ Combine gyro/accel sections. Adjust gyro scale. Out of scope of this project, re
 
 3. **Convert to binary format:**
 ```bash
-python3 convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
+python3 scripts/convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
 ```
 
 ### Calibration Parameters
@@ -143,19 +145,25 @@ python3 convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
 python3 lg_magic.py
 ```
 
+### capture_imu.py - Raw Capture
+```bash
+# Raw IMU samples for calibration (only python-evdev is required)
+python3 scripts/capture_imu.py samples.csv
+```
+
 ### display_imu.py - IMU Visualization
 ```bash
 # Raw IMU data display
-python3 display_imu.py
+python3 scripts/display_imu.py
 
 # AHRS
-python3 display_imu.py --calib calib.json --ahrs
+python3 scripts/display_imu.py --calib calib.json --ahrs
 
 # 3D orientation cube
-python3 display_imu.py --calib calib.json --cube
+python3 scripts/display_imu.py --calib calib.json --cube
 
 # Uinput airmouse
-python3 display_imu.py --calib calib.json --mouse
+python3 scripts/display_imu.py --calib calib.json --mouse
 ```
 
 ### Airmouse debug
@@ -166,7 +174,7 @@ The Python tools can create a virtual mouse device using uinput:
 sudo modprobe uinput
 
 # Run airmouse with calibration
-python3 display_imu.py --calib calib.json --mouse
+python3 scripts/display_imu.py --calib calib.json --mouse
 ```
 
 ## Technical Details
@@ -213,7 +221,7 @@ Other report types (0xF9, 0x01) were not observed, maybe used for other function
 - **Tested with**: LG Magic Remote MR20
 - **Kernel versions**: 4.15+ (tested on 6.11)
 - **Python**: 3.6+
-- **Dependencies**: numpy, scipy, pyqtgraph, python-evdev
+- **Dependencies**: python-evdev for raw capture; numpy, scipy, pyqtgraph for display and calibration
 
 ## Contributing
 

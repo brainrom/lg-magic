@@ -9,8 +9,8 @@ def main():
     parser = argparse.ArgumentParser(description="Convert JSON calibration file to calibration blob.")
     parser.add_argument("json_file", help="Path to input JSON file")
     parser.add_argument("output_file", help="Path to output binary file")
-    parser.add_argument("--alpha", type=float, required=True, help="Alpha filter coefficiant")
-    parser.add_argument("--mouse_k", type=float, required=True, help="Airmouse sensetivity")
+    parser.add_argument("--alpha", type=float, required=True, help="Alpha filter coefficient")
+    parser.add_argument("--mouse_k", type=float, required=True, help="Airmouse sensitivity")
 
     args = parser.parse_args()
 
