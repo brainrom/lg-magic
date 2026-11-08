@@ -18,6 +18,7 @@
 #include <linux/hid.h>
 #include <linux/input.h>
 #include <linux/firmware.h>
+#include <linux/errno.h>
 
 #include "lg_magic_airmouse.h"
 
@@ -55,7 +56,7 @@ struct lgmagic_drvdata {
 
 	u16 last_keycode;
 	u16 last_btncode;
-	float gyro_acc[3];
+	s64 gyro_acc[3];
 	int mode;
 	struct lg_magic_airmouse_calib calib;
 };
@@ -233,20 +234,24 @@ static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagi
 	if (ret)
 		return ret;
 
-	if (fw->size < sizeof(struct lg_magic_airmouse_calib)) {
+	if (lgmagic_convert_calib(&drvdata->calib, fw->data, fw->size))
+	{
+		lgmagic_dev_warn(dev, "Calibration %s is not a supported fixed-point blob (run scripts/convert_calib.py for legacy float files)", fwname);
+		memset(&drvdata->calib, 0, sizeof(drvdata->calib));
 		release_firmware(fw);
-		return 0;
+		return -EINVAL;
 	}
 
-	lgmagic_dev_info(dev, "Loading LG Magic calibration");
-	memcpy(&drvdata->calib, fw->data, sizeof(struct lg_magic_airmouse_calib));
 	release_firmware(fw);
+
 	if (lgmagic_validate_calib(&drvdata->calib))
 	{
-		lgmagic_dev_warn(dev, "Calibration table isn't valid. Airmouse disabled");
-		memset(&drvdata->calib, 0, sizeof(struct lg_magic_airmouse_calib));
-		return 0;
+		lgmagic_dev_warn(dev, "Calibration %s isn't valid", fwname);
+		memset(&drvdata->calib, 0, sizeof(drvdata->calib));
+		return -EINVAL;
 	}
+
+	lgmagic_dev_info(dev, "Loaded LG Magic calibration from %s", fwname);
 
 	return 0;
 }

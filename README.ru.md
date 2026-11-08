@@ -24,7 +24,8 @@
 - **scripts/imu_reader.py** - Общий модуль чтения evdev для записи и отображения
 - **scripts/lg_magic.py** - Низкоуровневый анализатор пакетов. Изначальный инструмент, сохранен для истории
 - **scripts/calibrate.py** - Утилита калибровки IMU
-- **scripts/convert_calib.py** - Конвертер калибровки в бинарный формат для модуля ядра
+- **scripts/convert_calib.py** - Конвертер JSON или старой float-калибровки в фиксированный формат для модуля ядра
+- **scripts/test_convert_calib.py** - Тесты конвертера калибровки
 - **scripts/display_imu.py** - Утилита визуализации IMU в реальном времени и эмуляция аэромыши
 
 ## Возможности модуля ядра
@@ -106,6 +107,20 @@ echo 2 > /sys/module/lg_magic/parameters/debug
 - `lg_magic_calib_XX_XX_XX_XX_XX_XX.bin` - Индивидуальный калибровочный файл по MAC-адресу
 - `lg_magic_calib.bin` - Калибровка по умолчанию
 
+Модуль ядра принимает только версионированный little-endian формат с фиксированной
+точкой, который создаёт `scripts/convert_calib.py`. Все значения — знаковые числа
+16.16, упакованные в 32 бита; драйвер не разбирает числа с плавающей точкой.
+
+Если у вас есть блоб, созданный старой версией проекта (8 native-endian значений
+IEEE-754 `float`), сконвертируйте его один раз:
+
+```bash
+python3 scripts/convert_calib.py legacy_float.bin lg_magic_calib.bin --from-legacy
+# Добавьте --legacy-endian big, если старый блоб создан на big-endian машине.
+```
+
+Конвертер проверяет диапазоны и отклоняет NaN/Inf.
+
 ### Создание файлов калибровки
 
 1. **Сбор данных IMU:**
@@ -128,6 +143,18 @@ python3 scripts/calibrate.py --gyro samples.csv calib_gyro.json
 3. **Конвертация в бинарный формат:**
 ```bash
 python3 scripts/convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
+```
+
+Запуск тестов конвертера:
+
+```bash
+python3 scripts/test_convert_calib.py
+```
+
+Математику с фиксированной точкой также можно проверить на хосте:
+
+```bash
+make -C tests check
 ```
 
 ### Параметры калибровки

@@ -24,7 +24,8 @@ This project provides a comprehensive Linux kernel driver and toolset for the LG
 - **scripts/imu_reader.py** - Shared evdev reader for capture and display
 - **scripts/lg_magic.py** - HIDRAW-level packet analyzer and debug tool. Initial tool, kept for historical reasons
 - **scripts/calibrate.py** - IMU calibration utility (accelerometer and gyroscope)
-- **scripts/convert_calib.py** - Converts JSON calibration to binary format for kernel module
+- **scripts/convert_calib.py** - Converts JSON or legacy float calibration to the fixed-point format used by the kernel module
+- **scripts/test_convert_calib.py** - Tests for the calibration converter
 - **scripts/display_imu.py** - Real-time IMU data visualization and airmouse emulation
 
 ## Kernel Module Features
@@ -106,6 +107,20 @@ The driver loads calibration data from binary files via Linux Firmware subsystem
 - `lg_magic_calib_XX_XX_XX_XX_XX_XX.bin` - MAC address-specific individual calibration
 - `lg_magic_calib.bin` - Fallback calibration
 
+The kernel module only accepts the versioned, little-endian fixed-point format
+written by `scripts/convert_calib.py`. All values are signed 16.16 fixed-point
+numbers stored in 32 bits; the driver never parses floating-point data.
+
+If you have a blob created by an older version of this project (8 native-endian
+IEEE-754 `float` values), convert it once:
+
+```bash
+python3 scripts/convert_calib.py legacy_float.bin lg_magic_calib.bin --from-legacy
+# Add --legacy-endian big if the old blob was created on a big-endian machine.
+```
+
+The converter validates the ranges and rejects NaN/Inf values.
+
 ### Creating Calibration Files
 
 1. **Collect IMU samples:**
@@ -129,6 +144,18 @@ Combine gyro/accel sections. Adjust gyro scale. Out of scope of this project, re
 3. **Convert to binary format:**
 ```bash
 python3 scripts/convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
+```
+
+Run the converter tests with:
+
+```bash
+python3 scripts/test_convert_calib.py
+```
+
+The fixed-point math can be tested on the host as well:
+
+```bash
+make -C tests check
 ```
 
 ### Calibration Parameters
