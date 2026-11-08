@@ -14,8 +14,4 @@ typedef int64_t s64;
 typedef uint16_t __le16;
 typedef uint32_t __le32;
 
-/* The tests only run on little-endian hosts. */
-#define le16_to_cpu(value) (value)
-#define le32_to_cpu(value) (value)
-
 #endif

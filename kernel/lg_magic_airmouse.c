@@ -16,6 +16,7 @@
 */
 
 #include <linux/build_bug.h>
+#include <asm/byteorder.h>
 #include <linux/errno.h>
 #include <linux/string.h>
 #include <linux/types.h>
