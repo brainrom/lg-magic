@@ -50,6 +50,10 @@ static int imu_evdev = 0;
 module_param(imu_evdev, int, 0644);
 MODULE_PARM_DESC(imu_evdev, "Expose raw IMU");
 
+static int power_key = 0;
+module_param(power_key, int, 0644);
+MODULE_PARM_DESC(power_key, "Report code 0x8000 as KEY_POWER instead of KEY_CHANNELUP");
+
 struct lgmagic_drvdata {
 	struct input_dev *input_hid;
 	struct input_dev *input_imu;
@@ -61,19 +65,31 @@ struct lgmagic_drvdata {
 	struct lg_magic_airmouse_calib calib;
 };
 
+#define LGMAGIC_REPORT_MOTION 0xFD
+#define LGMAGIC_MOTION_SIZE 20
+#define LGMAGIC_MOTION_STATE_MASK 0x03
+#define LGMAGIC_MOTION_VALID 1
+
+#define LGMAGIC_CODE_CHANNELUP 0x8000
 #define LGMAGIC_CODE_WHEEL 0x8044
+#define LGMAGIC_CODE_VOICE_START 0x800A
+#define LGMAGIC_CODE_VOICE_STOP 0x800D
+#define LGMAGIC_CODE_MOTION_START 0x803E
+#define LGMAGIC_CODE_MOTION_STOP 0x803F
 
 static const struct {
 	u16 code;
 	u16 keycode;
 } lg_btn_map[] = {
-	{ 0x8000, KEY_POWER },
+	{ LGMAGIC_CODE_CHANNELUP, KEY_CHANNELUP },
 	{ 0x8099, KEY_SLEEP },
+	{ 0x807E, KEY_SUSPEND },
 	{ 0x8010, KEY_0 }, { 0x8011, KEY_1 }, { 0x8012, KEY_2 },
 	{ 0x8013, KEY_3 }, { 0x8014, KEY_4 }, { 0x8015, KEY_5 },
 	{ 0x8016, KEY_6 }, { 0x8017, KEY_7 }, { 0x8018, KEY_8 }, { 0x8019, KEY_9 },
 	{ LGMAGIC_CODE_WHEEL, KEY_ENTER },
 	{ LGMAGIC_CODE_WHEEL, BTN_LEFT },
+	{ 0x804C, KEY_MINUS },
 	{ 0x8053, KEY_LIST },
 	{ 0x8045, KEY_MENU }, // ... button
 	{ 0x8002, KEY_VOLUMEUP },
@@ -83,11 +99,15 @@ static const struct {
 	{ 0x807C, KEY_HOME },
 	{ 0x8043, KEY_SETUP },
 	{ 0x8028, KEY_BACK },
+	{ 0x80AA, KEY_INFO },
 	{ 0x80AB, KEY_PROGRAM },
+	{ 0x80B5, KEY_APPSELECT },
+	{ 0x8056, KEY_PROG1 },
+	{ 0x805C, KEY_PROG2 },
 	{ 0x805D, KEY_MEDIA }, // IVI
 	{ 0x800B, KEY_TV },
 	{ 0x8098, KEY_CONTEXT_MENU }, // STB MENU
-	//{ 0x8000, KEY_CHANNELUP }, // Somehow it collides with power button
+	{ 0x80F0, KEY_RADIO },
 	{ 0x8001, KEY_CHANNELDOWN },
 	{ 0x8072, KEY_RED },
 	{ 0x8071, KEY_GREEN },
@@ -96,11 +116,28 @@ static const struct {
 	{ 0x8081, KEY_VIDEO }, // MOVIES
 	{ 0x80B0, KEY_PLAY },
 	{ 0x80BA, KEY_PAUSE },
+	{ 0x80B1, KEY_STOP },
+	{ 0x8039, KEY_SUBTITLE },
+	{ 0x8020, KEY_TEXT },
+	{ 0x8021, KEY_OPTION },
+	{ 0x809F, KEY_DATA },
+	{ 0x80A9, KEY_LANGUAGE },
+	{ 0x801E, KEY_FAVORITES },
+	{ 0x8079, KEY_ASPECT_RATIO },
+	{ 0x80AF, KEY_ZOOM },
 	{ 0x8040, KEY_UP },
 	{ 0x8041, KEY_DOWN },
 	{ 0x8006, KEY_RIGHT },
 	{ 0x8007, KEY_LEFT },
 };
+
+static bool lgmagic_code_is_control(u16 code)
+{
+	return code == LGMAGIC_CODE_VOICE_START ||
+	       code == LGMAGIC_CODE_VOICE_STOP ||
+	       code == LGMAGIC_CODE_MOTION_START ||
+	       code == LGMAGIC_CODE_MOTION_STOP;
+}
 
 static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 				u8 *data, int size)
@@ -119,9 +156,12 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 		return 0;
 	}
 
-	if (size != 20 || data[0] != 0xFD)
+	if (size < 1)
+		return 0;
+
+	if (size != LGMAGIC_MOTION_SIZE || data[0] != LGMAGIC_REPORT_MOTION)
 	{
-		lgmagic_dev_warn(&hdev->dev, "Unknown descriptor with size %d and type %x", size, data[0]);
+		lgmagic_dev_dbg(&hdev->dev, "Ignored report with size %d and type %x", size, data[0]);
 		return 0; // Not ours
 	}
 
@@ -139,15 +179,19 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 
 	if (btn_code != drvdata->last_btncode)
 	{
-		input_report_key(drvdata->input_hid, drvdata->last_keycode, 0);
+		if (drvdata->last_keycode)
+			input_report_key(drvdata->input_hid, drvdata->last_keycode, 0);
 		reporting = 1;
 		drvdata->last_keycode = 0;
 		drvdata->last_btncode = btn_code;
-		if (btn_code != 0)
+		if (btn_code != 0 && !lgmagic_code_is_control(btn_code))
 		{
 			for (int i = 0; i < ARRAY_SIZE(lg_btn_map); i++) {
 				if (lg_btn_map[i].code == btn_code) {
 					u16 report_keycode = lg_btn_map[i].keycode;
+
+					if (lg_btn_map[i].code==LGMAGIC_CODE_CHANNELUP && power_key)
+						report_keycode = KEY_POWER;
 
 					if (lg_btn_map[i].code==LGMAGIC_CODE_WHEEL && drvdata->mode)
 						report_keycode = BTN_LEFT;
@@ -174,7 +218,7 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 		reporting = 1;
 	}
 
-	if (airmouse)
+	if (airmouse && (data[3] & LGMAGIC_MOTION_STATE_MASK) == LGMAGIC_MOTION_VALID)
 	{
 		int bigmove = lgmagic_calc_mouse(&drvdata->calib, drvdata->gyro_acc, airmouse_threshold, imu, mouse);
 		if (bigmove)
@@ -302,6 +346,8 @@ loaded:
 
 	for (i = 0; i < ARRAY_SIZE(lg_btn_map); i++)
 		set_bit(lg_btn_map[i].keycode, drvdata->input_hid->keybit);
+
+	set_bit(KEY_POWER, drvdata->input_hid->keybit);
 
 	ret = input_register_device(drvdata->input_hid);
 	if (ret)
