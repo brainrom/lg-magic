@@ -19,3 +19,9 @@ __pycache__/
 
 # Host-side tests
 tests/test_airmouse_math
+
+# Voice daemon
+voice/lgmagicd
+voice/libpipewire-module-lgmagic.so
+voice/lgmagicd.service
+voice/lgmagicd-fifo.conf

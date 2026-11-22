@@ -1,0 +1,4 @@
+# Part of the voice package: hidraw of the remote is owned by the daemon
+# user only.  The number places it just after the generic udev defaults.
+SUBSYSTEM=="hidraw", SUBSYSTEMS=="hid", DRIVERS=="lgmagic", \
+    OWNER="lgmagic", MODE="0600"

@@ -1,0 +1,5 @@
+# Installed by `make install-fifo`.
+# The core unit runs D-Bus-only; this drop-in re-enables the optional FIFO.
+[Service]
+ExecStart=
+ExecStart=@BINDIR@/lgmagicd -p /run/lgmagic/voice.pcm

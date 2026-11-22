@@ -1,0 +1,46 @@
+[Unit]
+Description=LG Magic Remote microphone daemon
+After=systemd-udevd.service dbus.service
+Wants=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.lgmagic
+User=lgmagic
+Group=lgmagic
+RuntimeDirectory=lgmagic
+RuntimeDirectoryMode=0750
+RuntimeDirectoryPreserve=yes
+ExecStart=@BINDIR@/lgmagicd --no-fifo
+Restart=on-failure
+RestartSec=2
+
+# The daemon needs no capabilities: hidraw is handed to it by udev with
+# owner lgmagic and mode 0600, and the D-Bus policy lets lgmagic own the name.
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+DevicePolicy=closed
+DeviceAllow=char-hidraw rw
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

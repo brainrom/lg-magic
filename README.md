@@ -18,6 +18,13 @@ This project provides a comprehensive Linux kernel driver and toolset for the LG
 - **kernel/Makefile** - Build system for the kernel module
 - **51-lgimu.rules** - Udev rule for non-root raw IMU access. Place to `/etc/udev/rules.d/` if needed.
 
+### Voice Subproject
+
+- **voice/** - Optional microphone support: privileged `lgmagicd`, WirePlumber
+  PipeWire source module and optional FIFO fallback. See
+  [voice/README.md](voice/README.md) for architecture, D-Bus API, arm events,
+  security model and the detailed file list.
+
 ### Python Tools
 
 - **scripts/capture_imu.py** - Raw IMU capture for calibration (requires only python-evdev)
@@ -66,12 +73,48 @@ The airmouse feature is implemented in two ways:
 - 6-axis motion data (3-axis accel + 3-axis gyro)
 - Hardware counter for timing synchronization
 
+### Voice Input
+
+The remote microphone is a vendor HID stream, not a standard ALSA or HFP
+device. The optional [voice/](voice/README.md) subproject handles it:
+
+- `lgmagicd` is the privileged daemon. It is the only process that opens the
+  remote's hidraw node, arms the microphone on a physical button press,
+  decodes mSBC and passes a read-only PCM pipe to the session over D-Bus.
+- `libpipewire-module-lgmagic.so` is loaded by WirePlumber as a
+  `pw-module-client` component and publishes the `lg-magic-voice` source.
+  Applications use PipeWire; they never see hidraw and cannot arm the
+  microphone.
+- An optional FIFO fallback exists for simple installations that do not want
+  the WirePlumber module. It is a separate, group-based transport with its own
+  security trade-offs.
+
+Install the default D-Bus + WirePlumber path:
+
+```bash
+make -C voice
+sudo make -C voice install
+sudo systemd-sysusers
+sudo udevadm control --reload && sudo udevadm trigger
+sudo systemctl daemon-reload
+sudo systemctl reload dbus
+sudo systemctl enable --now lgmagicd
+systemctl --user restart wireplumber
+wpctl status
+```
+
+The source is named `lg-magic-voice` and is deliberately low priority, so it
+does not become the default microphone automatically. See
+[voice/README.md](voice/README.md) for the D-Bus interface, arm-event
+side-channel, FIFO fallback, security model, testing and detailed file list.
+
 ## Building and Installation
 
 ### Prerequisites
 - Linux kernel headers
 - DKMS (Dynamic Kernel Module Support)
 - Build essentials (make, gcc)
+- For optional voice support, see [voice/README.md](voice/README.md)
 
 ### Manual Build
 ```bash
@@ -273,6 +316,9 @@ Writing to the vendor GATT bank `d0ff` is a different matter entirely and
 must be avoided: writing `0x01` to characteristic `ffd1` reboots the remote
 into its DFU bootloader.
 
+The optional [voice/](voice/README.md) subproject handles the microphone
+stream in userspace.
+
 ### IMU Data Processing
 - **Sampling rate**: ~50Hz (20ms intervals)
 - **Data format**: Big-endian signed 16-bit values
@@ -290,12 +336,17 @@ into its DFU bootloader.
 - **Calibration**: `/lib/firmware/lg_magic_calib.bin`
 - **DKMS source**: `/usr/src/lg-magic-1.0/`
 
+Voice support installs its own files; see [voice/README.md](voice/README.md).
+
 ## Compatibility
 
 - **Tested with**: LG Magic Remote MR20
 - **Kernel versions**: 4.15+ (tested on 6.11)
 - **Python**: 3.6+
 - **Dependencies**: python-evdev for raw capture; numpy, scipy, pyqtgraph for display and calibration
+
+The optional voice subproject has additional dependencies; see
+[voice/README.md](voice/README.md).
 
 ## Not Implemented
 
