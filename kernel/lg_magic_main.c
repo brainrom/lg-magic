@@ -531,15 +531,16 @@ static void lgmagic_startup_work(struct work_struct *work)
 				      msecs_to_jiffies(LGMAGIC_SCD_RETRY_MS));
 }
 
-static void lgmagic_sanitize_mac(const char *uniq, char *out)
+static void lgmagic_calib_name(const char *uniq, char *out, size_t out_size)
 {
-	size_t i = 0;
-	for (i = 0; uniq[i] && i<17; i++) {
-		if (uniq[i] == ':')
-			out[i] = '_';  /* or just skip it */
-			else
-				out[i] = uniq[i];
-	}
+	char mac[18];
+	size_t i;
+
+	for (i = 0; i < 17 && uniq[i]; i++)
+		mac[i] = uniq[i] == ':' ? '_' : uniq[i];
+	mac[i] = '\0';
+
+	snprintf(out, out_size, "lg_magic_calib_%s.bin", mac);
 }
 
 static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagic_drvdata *drvdata)
@@ -598,8 +599,10 @@ static int lgmagic_probe(struct hid_device *hdev, const struct hid_device_id *id
 
 	if (strlen(hdev->uniq)==17)
 	{
-		char addr_fw_name[] = "lg_magic_calib_XX_XX_XX_XX_XX_XX.bin";
-		lgmagic_sanitize_mac(hdev->uniq, addr_fw_name+sizeof("lg_magic_calib_")-1);
+		char addr_fw_name[sizeof("lg_magic_calib_XX_XX_XX_XX_XX_XX.bin")];
+
+		lgmagic_calib_name(hdev->uniq, addr_fw_name,
+				   sizeof(addr_fw_name));
 		if (lgmagic_load_fw(addr_fw_name, &hdev->dev, drvdata)==0)
 			goto loaded;
 	}
