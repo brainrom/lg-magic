@@ -23,102 +23,320 @@ static s64 q16(double value)
 	return (s64)llround(value * LGMAGIC_FP_ONE);
 }
 
-static struct lg_magic_airmouse_calib make_calib(void)
+static void mat_identity(s64 m[3][3])
 {
-	struct lg_magic_airmouse_calib calib = {
-		.gyro_scale = { q16(0.07), q16(0.07), q16(0.07) },
-		.alpha = q16(0.2),
-		.mouse_k = q16(0.5),
+	memset(m, 0, sizeof(s64) * 9);
+	m[0][0] = LGMAGIC_FP_ONE;
+	m[1][1] = LGMAGIC_FP_ONE;
+	m[2][2] = LGMAGIC_FP_ONE;
+}
+
+static void mat_rz90(s64 m[3][3])
+{
+	memset(m, 0, sizeof(s64) * 9);
+	m[0][1] = -LGMAGIC_FP_ONE;
+	m[1][0] = LGMAGIC_FP_ONE;
+	m[2][2] = LGMAGIC_FP_ONE;
+}
+
+static struct lg_magic_airmouse_state make_state(void)
+{
+	struct lg_magic_airmouse_state state;
+
+	lgmagic_airmouse_init(&state);
+	mat_identity(state.gyro_matrix);
+	state.gyro_matrix_valid = 1;
+	state.sensitivity_x = LGMAGIC_FP_ONE;
+	state.sensitivity_y = LGMAGIC_FP_ONE;
+	state.dt = LGMAGIC_FP_ONE;
+	state.deadzone = 0;
+	state.gravity_valid = 1;
+	state.gravity[2] = -LGMAGIC_FP_ONE;
+
+	return state;
+}
+
+static void put_le32(u8 *p, u32 v)
+{
+	p[0] = (u8)v;
+	p[1] = (u8)(v >> 8);
+	p[2] = (u8)(v >> 16);
+	p[3] = (u8)(v >> 24);
+}
+
+static void put_float(u8 *p, float value)
+{
+	u32 bits;
+
+	memcpy(&bits, &value, sizeof(bits));
+	put_le32(p, bits);
+}
+
+static void write_scd_matrix(u8 *scd, size_t first_float,
+			     const double m[3][3])
+{
+	size_t base = 9;
+	int i, j;
+
+	for (i = 0; i < 3; i++)
+	{
+		for (j = 0; j < 3; j++)
+		{
+			size_t at = base + (first_float + 3 * i + j) * 4;
+
+			put_float(scd + at, (float)m[i][j]);
+		}
+	}
+}
+
+static void test_accel_gravity_direction(void)
+{
+	struct lg_magic_airmouse_state state = make_state();
+	s16 gyro[3] = { 0, 0, 0 };
+	s16 accel[3] = { 0, 0, -41 };
+	s16 mouse[2];
+
+	/* Raw path used by the blob-only calibration. */
+	state.gravity_valid = 0;
+	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
+	CHECK(llabs(state.gravity[0]) < 8);
+	CHECK(llabs(state.gravity[1]) < 8);
+	CHECK(llabs(state.gravity[2] + LGMAGIC_FP_ONE) < 8);
+
+	/* SCD remap path. */
+	state = make_state();
+	mat_rz90(state.accel_matrix);
+	state.accel_matrix_valid = 1;
+	state.gravity_valid = 0;
+	accel[0] = 41;
+	accel[2] = 0;
+	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
+	CHECK(llabs(state.gravity[0]) < 8);
+	CHECK(llabs(state.gravity[1] - LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(state.gravity[2]) < 8);
+}
+
+static void test_gravity_projection(void)
+{
+	static const double angles[] = { 0.0, 45.0, 90.0, 135.0, -90.0 };
+	const double pi = 3.14159265358979323846;
+	s64 pointing[3] = { 0, LGMAGIC_FP_ONE, 0 };
+	s64 gravity0[3] = { 0, 0, -LGMAGIC_FP_ONE };
+	s64 omega0[3] = { 0, LGMAGIC_FP_ONE, 0 };
+	s64 yaw, pitch;
+
+	/* A roll about the pointing axis must not move the cursor. */
+	CHECK(lgmagic_project(omega0, gravity0, pointing, &yaw, &pitch) == 0);
+	CHECK(llabs(yaw) < 8);
+	CHECK(llabs(pitch) < 8);
+
+	/* A physical yaw about the world vertical is roll invariant. */
+	for (unsigned int i = 0; i < sizeof(angles) / sizeof(angles[0]); i++)
+	{
+		double a = angles[i] * pi / 180.0;
+		s64 gravity[3] = { q16(-sin(a)), 0, q16(-cos(a)) };
+		s64 omega[3] = { gravity[0], gravity[1], gravity[2] };
+
+		CHECK(lgmagic_project(omega, gravity, pointing,
+				      &yaw, &pitch) == 0);
+		CHECK(llabs(yaw - LGMAGIC_FP_ONE) < 16);
+		CHECK(llabs(pitch) < 16);
+	}
+}
+
+static void test_cursor_sign_matches_kernel_convention(void)
+{
+	struct lg_magic_airmouse_state state = make_state();
+	s16 gyro[3] = { 2, 0, 3 };
+	s16 accel[3] = { 0, 0, -41 };
+	s16 mouse[2];
+
+	state.gravity_alpha = 0;
+
+	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
+	CHECK(mouse[0] == 3);	/* +omega_z */
+	CHECK(mouse[1] == 2);	/* +omega_x */
+}
+
+static void test_remap_rotates_pointing_and_keeps_projection(void)
+{
+	struct lg_magic_airmouse_state state = make_state();
+	s64 remap[3][3];
+	s16 gyro[3] = { 2, 0, 3 };
+	s16 accel[3] = { 0, 0, -41 };
+	s16 mouse[2];
+
+	mat_rz90(state.gyro_matrix);
+	mat_rz90(state.accel_matrix);
+	state.accel_matrix_valid = 1;
+	mat_rz90(remap);
+	lgmagic_airmouse_set_remap(&state, remap);
+
+	CHECK(llabs(state.pointing[0] + LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(state.pointing[1]) < 8);
+	CHECK(llabs(state.pointing[2]) < 8);
+
+	state.gravity_alpha = 0;
+	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
+	CHECK(mouse[0] == 3);
+	CHECK(mouse[1] == 2);
+}
+
+static void test_auto_bias_converges(void)
+{
+	struct lg_magic_airmouse_state state = make_state();
+	s16 gyro[3] = { 100, -100, 50 };
+	s16 accel[3] = { 0, 0, -41 };
+	s16 mouse[2];
+	int i;
+
+	state.auto_bias = 1;
+	state.bias_beta = q16(0.5);
+	state.zero_rate = q16(1000.0);
+	state.gravity_alpha = 0;
+
+	for (i = 0; i < 40; i++)
+		lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
+
+	CHECK(llabs(state.gyro_bias[0] - q16(100.0)) < 2);
+	CHECK(llabs(state.gyro_bias[1] - q16(-100.0)) < 2);
+	CHECK(llabs(state.gyro_bias[2] - q16(50.0)) < 2);
+}
+
+static void test_scd_matrix_validation(void)
+{
+	u8 scd[LGMAGIC_SCD_SIZE];
+	s64 gyro[3][3], accel[3][3], remap[3][3], accel_scale;
+	double gm[3][3] = {
+		{ 0.001, 0.0, 0.0 },
+		{ 0.0, 0.001, 0.0 },
+		{ 0.0, 0.0, 0.001 },
+	};
+	double am[3][3] = {
+		{ 78.4, 0.0, 0.0 },
+		{ 0.0, 78.4, 0.0 },
+		{ 0.0, 0.0, 78.4 },
 	};
 
-	return calib;
+	memset(scd, 0, sizeof(scd));
+	memcpy(scd, "\x00\x04\x01\x05\x00", 5);
+	write_scd_matrix(scd, 24, gm);
+	write_scd_matrix(scd, 2, am);
+
+	/* Identity remap and equal scales are accepted. */
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, &accel_scale) == 0);
+
+	/* Per-axis scales are accepted after normalisation. */
+	gm[0][0] = 0.0005;
+	gm[1][1] = 0.001;
+	gm[2][2] = 0.0015;
+	write_scd_matrix(scd, 24, gm);
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, &accel_scale) == 0);
+	CHECK(llabs(gyro[0][0] - q16(0.0005)) <= 1);
+	CHECK(llabs(gyro[1][1] - q16(0.001)) <= 1);
+	CHECK(llabs(gyro[2][2] - q16(0.0015)) <= 1);
+	CHECK(llabs(remap[0][0] - LGMAGIC_FP_ONE) < 8);
+
+	/* Short payloads and wrong headers are rejected. */
+	CHECK(lgmagic_parse_scd_matrices(scd, LGMAGIC_SCD_SIZE - 1, gyro,
+					 accel, remap, &accel_scale) == -EINVAL);
+	CHECK(lgmagic_parse_scd_matrices(scd, 140, gyro, accel, remap,
+					 &accel_scale) == -EINVAL);
+	scd[0] = 0xff;
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, &accel_scale) == -EINVAL);
+	scd[0] = 0x00;
+
+	/* A reflection is an inversion, not a remap. */
+	gm[0][0] = -0.001;
+	gm[1][1] = 0.001;
+	gm[2][2] = 0.001;
+	write_scd_matrix(scd, 24, gm);
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, &accel_scale) == -EINVAL);
+
+	/* A singular matrix is rejected. */
+	gm[0][0] = 0.0;
+	gm[1][1] = 0.0;
+	gm[2][2] = 0.0;
+	write_scd_matrix(scd, 24, gm);
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, &accel_scale) == -EINVAL);
 }
 
-static uint32_t rng_state = 0x12345678;
-
-static s16 rng_gyro(void)
+static void test_scd_independent_remaps(void)
 {
-	rng_state = rng_state * 1664525u + 1013904223u;
-	return (s16)((int)(rng_state >> 16) % 241 - 120);
-}
+	u8 scd[LGMAGIC_SCD_SIZE];
+	s64 gyro[3][3], accel[3][3], remap[3][3], accel_scale;
+	double gm[3][3] = {
+		{ 0.0, -0.001, 0.0 },
+		{ 0.001, 0.0, 0.0 },
+		{ 0.0, 0.0, 0.001 },
+	};
+	double am[3][3] = {
+		{ 78.4, 0.0, 0.0 },
+		{ 0.0, 78.4, 0.0 },
+		{ 0.0, 0.0, 78.4 },
+	};
 
-static int calc_mouse_float(const float *bias, const float *scale,
-			    float alpha, float mouse_k, u16 threshold,
-			    float *acc, const s16 *gyro, s16 *mouse)
-{
-	for (int i = 0; i < 3; i++) {
-		float corr = ((float)gyro[i] - bias[i]) * scale[i];
-
-		acc[i] = alpha * corr + (1.0f - alpha) * acc[i];
-	}
-
-	mouse[0] = (s16)(acc[2] * mouse_k);
-	mouse[1] = (s16)(acc[0] * mouse_k);
-
-	return fabsf(acc[0]) > threshold || fabsf(acc[2]) > threshold;
-}
-
-static void test_zero_mean_noise_does_not_drift(void)
-{
-	struct lg_magic_airmouse_calib calib = make_calib();
-	const float bias[3] = { 0.0f, 0.0f, 0.0f };
-	const float scale[3] = { 0.07f, 0.07f, 0.07f };
-	const float alpha = 0.2f;
-	const float mouse_k = 0.5f;
-	const u16 threshold = 300;
-	float float_acc[3] = { 0.0f, 0.0f, 0.0f };
-	s64 fixed_acc[3] = { 0, 0, 0 };
-	long long float_sum = 0;
-	long long fixed_sum = 0;
-
-	for (int i = 0; i < 200000; i++) {
-		s16 gyro[3] = { rng_gyro(), 0, rng_gyro() };
-		s16 float_mouse[2];
-		s16 fixed_mouse[2];
-
-		calc_mouse_float(bias, scale, alpha, mouse_k, threshold,
-				 float_acc, gyro, float_mouse);
-		lgmagic_calc_mouse(&calib, fixed_acc, threshold, gyro, fixed_mouse);
-
-		float_sum += float_mouse[0] + float_mouse[1];
-		fixed_sum += fixed_mouse[0] + fixed_mouse[1];
-	}
+	memset(scd, 0, sizeof(scd));
+	memcpy(scd, "\x00\x04\x01\x05\x00", 5);
+	write_scd_matrix(scd, 24, gm);
+	write_scd_matrix(scd, 2, am);
 
 	/*
-	 * A right shift in the conversion back to integer rounds negative
-	 * values towards -infinity and accumulates a negative drift.  Keep
-	 * the accumulated error close to the float implementation.
+	 * Separate chips may have different sensor frames.  Each matrix maps
+	 * its own frame into the device frame, so the rotations need not match.
 	 */
-	CHECK(llabs(fixed_sum - float_sum) < 2000);
-	CHECK(llabs(fixed_sum) < 2000);
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, &accel_scale) == 0);
+	CHECK(llabs(remap[0][1] + LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(remap[1][0] - LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(remap[2][2] - LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(accel[0][0] - q16(78.4)) <= 2);
+	CHECK(llabs(accel[0][1]) < 8);
 }
 
-static void test_constant_negative_input_does_not_drift(void)
+static void test_scd_real_payload(void)
 {
-	struct lg_magic_airmouse_calib calib = make_calib();
-	const float bias[3] = { 0.0f, 0.0f, 0.0f };
-	const float scale[3] = { 0.07f, 0.07f, 0.07f };
-	const u16 threshold = 300;
-	float float_acc[3] = { 0.0f, 0.0f, 0.0f };
-	s64 fixed_acc[3] = { 0, 0, 0 };
-	long long float_sum = 0;
-	long long fixed_sum = 0;
+	static const u8 scd[260] = {
+		0x00, 0x04, 0x01, 0x05, 0x00, 0xfb, 0xfa, 0xe1, 0xe7, 0x0a, 0xd7, 0x23,
+		0x3c, 0x0a, 0xd7, 0xa3, 0x3c, 0xcd, 0xcc, 0x9c, 0x28, 0xcd, 0xcc, 0x9c,
+		0xc2, 0x00, 0x00, 0x00, 0x00, 0xcd, 0xcc, 0x9c, 0x42, 0xcd, 0xcc, 0x9c,
+		0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0xcd, 0xcc, 0x9c, 0x42, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+		0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+		0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+		0x80, 0x00, 0x00, 0x00, 0x80, 0xe0, 0x2d, 0x10, 0x41, 0xe0, 0x2d, 0x10,
+		0x41, 0xe0, 0x2d, 0x10, 0x41, 0x00, 0x00, 0x80, 0xbf, 0x6f, 0xa1, 0x8b,
+		0x20, 0x6f, 0xa1, 0x8b, 0xba, 0x00, 0x00, 0x00, 0x00, 0x6f, 0xa1, 0x8b,
+		0x3a, 0x6f, 0xa1, 0x8b, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x6f, 0xa1, 0x8b, 0x3a, 0x00, 0x00, 0x00,
+		0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6f, 0xa1, 0x8b,
+		0x3a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6f, 0xa1, 0x8b,
+		0x3a, 0x00, 0x00, 0x80, 0x3f, 0x6f, 0xa1, 0x8b, 0x3a, 0x0a, 0x1c, 0x01,
+		0x40, 0xc2, 0xb8, 0xb2, 0x3e, 0x5d, 0xc4, 0x27, 0x40, 0x5d, 0xc4, 0x27,
+		0x40, 0x5d, 0xc4, 0x27, 0x40, 0x00, 0x48, 0x46, 0xc1, 0x64, 0x43, 0xc4,
+		0x3d, 0xa9, 0x58, 0xd1, 0x39, 0xe4, 0xba, 0xac,
+	};
+	s64 gyro[3][3], accel[3][3], remap[3][3], accel_scale;
+	const double gs = 0.0010652969358488917;
+	const double as = 78.4000015258789;
 
-	for (int i = 0; i < 100000; i++) {
-		s16 gyro[3] = { -1, 0, -1 };
-		s16 float_mouse[2];
-		s16 fixed_mouse[2];
-
-		calc_mouse_float(bias, scale, 0.2f, 0.5f, threshold,
-				 float_acc, gyro, float_mouse);
-		lgmagic_calc_mouse(&calib, fixed_acc, threshold, gyro, fixed_mouse);
-
-		float_sum += float_mouse[0] + float_mouse[1];
-		fixed_sum += fixed_mouse[0] + fixed_mouse[1];
-	}
-
-	CHECK(float_sum == 0);
-	CHECK(fixed_sum == 0);
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, &accel_scale) == 0);
+	CHECK(llabs(gyro[0][1] + q16(gs)) <= 1);
+	CHECK(llabs(gyro[1][0] - q16(gs)) <= 1);
+	CHECK(llabs(gyro[2][2] - q16(gs)) <= 1);
+	CHECK(llabs(accel[0][1] + q16(as)) <= 2);
+	CHECK(llabs(accel[1][0] - q16(as)) <= 2);
+	CHECK(llabs(accel[2][2] - q16(as)) <= 2);
 }
 
 static struct lgmagic_calib_blob make_blob(void)
@@ -141,81 +359,53 @@ static struct lgmagic_calib_blob make_blob(void)
 	return blob;
 }
 
-static void test_blob_roundtrip(void)
+static void test_phys_calib_parse(void)
 {
+	const double pi = 3.14159265358979323846;
 	struct lgmagic_calib_blob blob = make_blob();
-	struct lg_magic_airmouse_calib calib;
+	s64 bias[3], scale[3];
 
-	CHECK(lgmagic_convert_calib(&calib, (const u8 *)&blob, sizeof(blob)) == 0);
-	CHECK(calib.gyro_bias[0] == q16(1.5));
-	CHECK(calib.gyro_bias[1] == q16(-2.25));
-	CHECK(calib.gyro_bias[2] == q16(3.0));
-	CHECK(calib.gyro_scale[0] == q16(0.07));
-	CHECK(calib.gyro_scale[1] == q16(0.08));
-	CHECK(calib.gyro_scale[2] == q16(0.09));
-	CHECK(calib.alpha == q16(0.2));
-	CHECK(calib.mouse_k == q16(0.5));
-	CHECK(lgmagic_validate_calib(&calib) == 0);
-}
+	CHECK(lgmagic_parse_calib_phys(bias, scale, (const u8 *)&blob,
+				       sizeof(blob)) == 0);
+	CHECK(bias[0] == q16(1.5));
+	CHECK(bias[1] == q16(-2.25));
+	CHECK(bias[2] == q16(3.0));
+	CHECK(llabs(scale[0] - q16(0.07 * pi / 180.0)) <= 1);
+	CHECK(llabs(scale[1] - q16(0.08 * pi / 180.0)) <= 1);
+	CHECK(llabs(scale[2] - q16(0.09 * pi / 180.0)) <= 1);
 
-static void test_blob_rejects_bad_header(void)
-{
-	struct lgmagic_calib_blob blob;
-	struct lg_magic_airmouse_calib calib;
+	/* zero/negative scale marks the blob as broken */
+	blob = make_blob();
+	blob.gyro_scale[0] = 0;
+	CHECK(lgmagic_parse_calib_phys(bias, scale, (const u8 *)&blob,
+				       sizeof(blob)) == -EINVAL);
 
+	blob = make_blob();
+	blob.gyro_scale[0] = (u32)(s32)q16(-0.07);
+	CHECK(lgmagic_parse_calib_phys(bias, scale, (const u8 *)&blob,
+				       sizeof(blob)) == -EINVAL);
+
+	/* bad header and truncated payload */
 	blob = make_blob();
 	blob.magic = 0;
-	CHECK(lgmagic_convert_calib(&calib, (const u8 *)&blob, sizeof(blob)) == -EINVAL);
-
+	CHECK(lgmagic_parse_calib_phys(bias, scale, (const u8 *)&blob,
+				       sizeof(blob)) == -EINVAL);
 	blob = make_blob();
-	blob.version = LGMAGIC_CALIB_VERSION + 1;
-	CHECK(lgmagic_convert_calib(&calib, (const u8 *)&blob, sizeof(blob)) == -EINVAL);
-
-	blob = make_blob();
-	blob.size = sizeof(blob) - 1;
-	CHECK(lgmagic_convert_calib(&calib, (const u8 *)&blob, sizeof(blob)) == -EINVAL);
-
-	blob = make_blob();
-	CHECK(lgmagic_convert_calib(&calib, (const u8 *)&blob, sizeof(blob) - 1) == -EINVAL);
-}
-
-static void test_validation_ranges(void)
-{
-	struct lg_magic_airmouse_calib calib = make_calib();
-
-	CHECK(lgmagic_validate_calib(&calib) == 0);
-
-	calib.gyro_bias[0] = 101 * LGMAGIC_FP_ONE;
-	CHECK(lgmagic_validate_calib(&calib) == 1);
-
-	calib = make_calib();
-	calib.gyro_scale[0] = 11 * LGMAGIC_FP_ONE;
-	CHECK(lgmagic_validate_calib(&calib) == 1);
-
-	calib = make_calib();
-	calib.alpha = -1;
-	CHECK(lgmagic_validate_calib(&calib) == 1);
-
-	calib = make_calib();
-	calib.alpha = LGMAGIC_FP_ONE + 1;
-	CHECK(lgmagic_validate_calib(&calib) == 1);
-
-	calib = make_calib();
-	calib.mouse_k = -1;
-	CHECK(lgmagic_validate_calib(&calib) == 1);
-
-	calib = make_calib();
-	calib.mouse_k = LGMAGIC_FP_ONE + 1;
-	CHECK(lgmagic_validate_calib(&calib) == 1);
+	CHECK(lgmagic_parse_calib_phys(bias, scale, (const u8 *)&blob,
+				       sizeof(blob) - 1) == -EINVAL);
 }
 
 int main(void)
 {
-	test_zero_mean_noise_does_not_drift();
-	test_constant_negative_input_does_not_drift();
-	test_blob_roundtrip();
-	test_blob_rejects_bad_header();
-	test_validation_ranges();
+	test_accel_gravity_direction();
+	test_gravity_projection();
+	test_cursor_sign_matches_kernel_convention();
+	test_remap_rotates_pointing_and_keeps_projection();
+	test_auto_bias_converges();
+	test_scd_matrix_validation();
+	test_scd_independent_remaps();
+	test_scd_real_payload();
+	test_phys_calib_parse();
 
 	if (failures) {
 		fprintf(stderr, "%d test(s) failed\n", failures);

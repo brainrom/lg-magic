@@ -20,7 +20,9 @@
 #include <linux/firmware.h>
 #include <linux/errno.h>
 #include <linux/jiffies.h>
+#include <linux/kstrtox.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
 
@@ -44,20 +46,41 @@ do { dev_err(dev, fmt, ##__VA_ARGS__); } while (0)
 
 static int airmouse = 1;
 module_param(airmouse, int, 0644);
-MODULE_PARM_DESC(airmouse, "Report mouse events");
+MODULE_PARM_DESC(airmouse, "Enable air mouse at probe (per-device sysfs override)");
 
 static int airmouse_threshold = 300;
 module_param(airmouse_threshold, int, 0644);
-MODULE_PARM_DESC(airmouse_threshold, "Airmouse enable threshold");
+MODULE_PARM_DESC(airmouse_threshold, "Shake threshold at probe, deg/s (per-device sysfs override)");
+
+static int sensitivity_x = 600;
+module_param(sensitivity_x, int, 0644);
+MODULE_PARM_DESC(sensitivity_x, "Cursor sensitivity X at probe, px/rad (per-device sysfs override)");
+
+static int sensitivity_y = 600;
+module_param(sensitivity_y, int, 0644);
+MODULE_PARM_DESC(sensitivity_y, "Cursor sensitivity Y at probe, px/rad (per-device sysfs override)");
 
 static int imu_evdev = 0;
 module_param(imu_evdev, int, 0644);
 MODULE_PARM_DESC(imu_evdev, "Expose raw IMU");
 
+#define LGMAGIC_THRESHOLD_MAX	100000	/* deg/s */
+#define LGMAGIC_SENSITIVITY_MAX	100000	/* px/rad */
+
+static int lgmagic_clamp_param(int value, int max)
+{
+	if (value < 0)
+		return 0;
+	if (value > max)
+		return max;
+	return value;
+}
+
 #define LGMAGIC_SCD_MAX 512
 #define LGMAGIC_FW_VER_MAX 32
 #define LGMAGIC_SCD_RETRIES 3
 #define LGMAGIC_SCD_RETRY_MS 1000
+#define LGMAGIC_SCD_CACHE_MAX 4
 
 struct lgmagic_drvdata {
 	struct input_dev *input_hid;
@@ -68,6 +91,10 @@ struct lgmagic_drvdata {
 	unsigned int scd_retries;
 	bool started;
 	bool shutdown;
+	bool blob_valid;
+	bool pointer_ready;
+	bool airmouse_enabled;
+	bool motion_on;
 
 	spinlock_t lock;
 	u8 fw_ver[LGMAGIC_FW_VER_MAX];
@@ -82,15 +109,15 @@ struct lgmagic_drvdata {
 
 	u16 last_keycode;
 	u16 last_btncode;
-	s64 gyro_acc[3];
 	int mode;
-	struct lg_magic_airmouse_calib calib;
+	struct lg_magic_airmouse_state airmouse;
 };
 
 #define LGMAGIC_REPORT_CMD 0xF9
 #define LGMAGIC_REPORT_VOICE 0xFE
 
 #define LGMAGIC_CMD_MOTION_ON 0x01
+#define LGMAGIC_CMD_MOTION_SLEEP 0x02
 #define LGMAGIC_CMD_FW_VER 0x11
 #define LGMAGIC_CMD_SCD 0x17
 
@@ -154,11 +181,7 @@ static int lgmagic_cmd_send(struct hid_device *hdev, u8 opcode)
 	return ret < 0 ? ret : -EIO;
 }
 
-/*
- * Start a fresh SCD transfer.  The remote answers F9 17 with a sequence of
- * chunks; a new request discards a previous partial transfer so a stale
- * response cannot be appended to the new one.
- */
+/* A new request discards any partial SCD transfer. */
 static void lgmagic_request_scd(struct lgmagic_drvdata *drvdata)
 {
 	unsigned long flags;
@@ -170,6 +193,147 @@ static void lgmagic_request_scd(struct lgmagic_drvdata *drvdata)
 	spin_unlock_irqrestore(&drvdata->lock, flags);
 
 	lgmagic_cmd_send(drvdata->hdev, LGMAGIC_CMD_SCD);
+}
+
+static void lgmagic_set_motion(struct lgmagic_drvdata *drvdata, bool on)
+{
+	int ret = lgmagic_cmd_send(drvdata->hdev,
+				   on ? LGMAGIC_CMD_MOTION_ON :
+					LGMAGIC_CMD_MOTION_SLEEP);
+
+	if (ret == 0)
+		drvdata->motion_on = on;
+}
+
+static void lgmagic_set_airmouse(struct lgmagic_drvdata *drvdata, bool on)
+{
+	drvdata->airmouse_enabled = on;
+
+	if (!on)
+	{
+		drvdata->mode = 0;
+		drvdata->airmouse.gravity_valid = 0;
+	}
+
+	lgmagic_set_motion(drvdata, on);
+}
+
+struct lgmagic_scd_cache_entry {
+	char uniq[18];
+	s64 gyro_matrix[3][3];
+	s64 accel_matrix[3][3];
+	s64 gyro_remap[3][3];
+	s64 accel_scale;
+	u8 raw[LGMAGIC_SCD_SIZE];
+	bool valid;
+};
+
+static struct lgmagic_scd_cache_entry lgmagic_scd_cache[LGMAGIC_SCD_CACHE_MAX];
+static DEFINE_SPINLOCK(lgmagic_scd_cache_lock);
+static unsigned int lgmagic_scd_cache_next;
+
+static bool lgmagic_scd_cache_lookup(const char *uniq, s64 gyro_matrix[3][3],
+				     s64 accel_matrix[3][3],
+				     s64 gyro_remap[3][3],
+				     s64 *accel_scale,
+				     u8 raw[LGMAGIC_SCD_SIZE])
+{
+	unsigned long flags;
+	bool found = false;
+	int i;
+
+	if (!uniq || !uniq[0])
+		return false;
+
+	spin_lock_irqsave(&lgmagic_scd_cache_lock, flags);
+	for (i = 0; i < LGMAGIC_SCD_CACHE_MAX; i++)
+	{
+		if (lgmagic_scd_cache[i].valid &&
+		    !strcmp(lgmagic_scd_cache[i].uniq, uniq))
+		{
+			memcpy(gyro_matrix, lgmagic_scd_cache[i].gyro_matrix,
+			       sizeof(lgmagic_scd_cache[i].gyro_matrix));
+			memcpy(accel_matrix, lgmagic_scd_cache[i].accel_matrix,
+			       sizeof(lgmagic_scd_cache[i].accel_matrix));
+			memcpy(gyro_remap, lgmagic_scd_cache[i].gyro_remap,
+			       sizeof(lgmagic_scd_cache[i].gyro_remap));
+			*accel_scale = lgmagic_scd_cache[i].accel_scale;
+			memcpy(raw, lgmagic_scd_cache[i].raw,
+			       sizeof(lgmagic_scd_cache[i].raw));
+			found = true;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&lgmagic_scd_cache_lock, flags);
+
+	return found;
+}
+
+static void lgmagic_scd_cache_store(const char *uniq,
+				    const s64 gyro_matrix[3][3],
+				    const s64 accel_matrix[3][3],
+				    const s64 gyro_remap[3][3],
+				    s64 accel_scale,
+				    const u8 *raw)
+{
+	unsigned long flags;
+	int i, slot = -1;
+
+	if (!uniq || !uniq[0])
+		return;
+
+	spin_lock_irqsave(&lgmagic_scd_cache_lock, flags);
+	for (i = 0; i < LGMAGIC_SCD_CACHE_MAX; i++)
+	{
+		if (lgmagic_scd_cache[i].valid &&
+		    !strcmp(lgmagic_scd_cache[i].uniq, uniq))
+		{
+			slot = i;
+			break;
+		}
+		if (!lgmagic_scd_cache[i].valid && slot < 0)
+			slot = i;
+	}
+	if (slot < 0)
+		slot = lgmagic_scd_cache_next++ % LGMAGIC_SCD_CACHE_MAX;
+
+	strscpy(lgmagic_scd_cache[slot].uniq, uniq,
+		sizeof(lgmagic_scd_cache[slot].uniq));
+	memcpy(lgmagic_scd_cache[slot].gyro_matrix, gyro_matrix,
+	       sizeof(lgmagic_scd_cache[slot].gyro_matrix));
+	memcpy(lgmagic_scd_cache[slot].accel_matrix, accel_matrix,
+	       sizeof(lgmagic_scd_cache[slot].accel_matrix));
+	memcpy(lgmagic_scd_cache[slot].gyro_remap, gyro_remap,
+	       sizeof(lgmagic_scd_cache[slot].gyro_remap));
+	memcpy(lgmagic_scd_cache[slot].raw, raw,
+	       sizeof(lgmagic_scd_cache[slot].raw));
+	lgmagic_scd_cache[slot].accel_scale = accel_scale;
+	lgmagic_scd_cache[slot].valid = true;
+	spin_unlock_irqrestore(&lgmagic_scd_cache_lock, flags);
+}
+
+/* A blob wins over the SCD gyro matrix; the accel matrix is still useful. */
+static void lgmagic_apply_scd_matrices(struct lgmagic_drvdata *drvdata,
+				       const s64 gyro_matrix[3][3],
+				       const s64 accel_matrix[3][3],
+				       const s64 gyro_remap[3][3],
+				       s64 accel_scale)
+{
+	drvdata->airmouse.accel_scale = accel_scale;
+
+	/* A blob is raw-frame; do not mix it with the SCD remap. */
+	if (drvdata->blob_valid)
+		return;
+
+	memcpy(drvdata->airmouse.gyro_matrix, gyro_matrix,
+	       sizeof(drvdata->airmouse.gyro_matrix));
+	memcpy(drvdata->airmouse.accel_matrix, accel_matrix,
+	       sizeof(drvdata->airmouse.accel_matrix));
+	lgmagic_airmouse_set_remap(&drvdata->airmouse, gyro_remap);
+	drvdata->airmouse.gyro_matrix_valid = 1;
+	drvdata->airmouse.accel_matrix_valid = 1;
+	drvdata->airmouse.auto_bias = 1;
+	drvdata->pointer_ready = true;
 }
 
 static void lgmagic_fw_version(struct hid_device *hdev, u8 *data, int size)
@@ -194,16 +358,17 @@ static void lgmagic_fw_version(struct hid_device *hdev, u8 *data, int size)
 			 data[3], (int)len, data + 4);
 }
 
-/* The remote reuses one transmit buffer, so everything past data[3] bytes
- * is the previous frame and must not be stored.  Only chunks belonging to an
- * outstanding F9 17 request are accepted.
- */
+/* Bytes past data[3] are the previous frame; only expected chunks count. */
 static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
 {
 	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
 	unsigned long flags;
+	s64 gyro_matrix[3][3], accel_matrix[3][3], gyro_remap[3][3];
+	s64 accel_scale = 0;
+	u8 raw[LGMAGIC_SCD_SIZE];
 	size_t len, total;
 	bool complete = false;
+	bool parsed = false;
 
 	if (size < 4)
 		return;
@@ -229,13 +394,48 @@ static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
 		drvdata->scd_expected = false;
 		drvdata->scd_done = true;
 		complete = true;
+		parsed = lgmagic_parse_scd_matrices(drvdata->scd, total,
+						    gyro_matrix,
+						    accel_matrix,
+						    gyro_remap,
+						    &accel_scale) == 0;
+		if (parsed)
+			memcpy(raw, drvdata->scd, sizeof(raw));
 	}
 	spin_unlock_irqrestore(&drvdata->lock, flags);
 
 	lgmagic_dev_dbg(&hdev->dev, "SCD %zu bytes, more %u", len, data[2]);
 
-	if (complete)
-		lgmagic_dev_info(&hdev->dev, "SCD complete: %zu bytes", total);
+	if (!complete)
+		return;
+
+	lgmagic_dev_info(&hdev->dev, "SCD complete: %zu bytes", total);
+	cancel_delayed_work(&drvdata->scd_retry);
+
+	if (parsed)
+	{
+		lgmagic_scd_cache_store(hdev->uniq, gyro_matrix, accel_matrix,
+					gyro_remap, accel_scale, raw);
+		lgmagic_apply_scd_matrices(drvdata, gyro_matrix, accel_matrix,
+					   gyro_remap, accel_scale);
+		lgmagic_dev_info(&hdev->dev,
+				 "SCD matrices accepted, accel scale %lld (Q16.16)",
+				 accel_scale);
+		return;
+	}
+
+	if (drvdata->blob_valid || drvdata->pointer_ready)
+	{
+		lgmagic_dev_warn(&hdev->dev,
+				 "SCD is not usable; keeping the current calibration");
+		return;
+	}
+
+	lgmagic_dev_warn(&hdev->dev,
+			 "SCD is not usable; air mouse stays disabled");
+	drvdata->scd_done = false;
+	schedule_delayed_work(&drvdata->scd_retry,
+			      msecs_to_jiffies(LGMAGIC_SCD_RETRY_MS));
 }
 
 static void lgmagic_cmd_response(struct hid_device *hdev, u8 *data, int size)
@@ -349,13 +549,15 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 		reporting = 1;
 	}
 
-	if (airmouse)
+	if (drvdata->airmouse_enabled && drvdata->pointer_ready)
 	{
-		int bigmove = lgmagic_calc_mouse(&drvdata->calib, drvdata->gyro_acc, airmouse_threshold, imu, mouse);
+		int bigmove = lgmagic_calc_mouse_gravity(&drvdata->airmouse,
+							 imu, &imu[3],
+							 mouse);
 		if (bigmove)
 			drvdata->mode = 1;
 
-		if (drvdata->mode==1)
+		if (drvdata->mode == 1)
 		{
 			input_report_rel(drvdata->input_hid, REL_X, mouse[0]);
 			input_report_rel(drvdata->input_hid, REL_Y, mouse[1]);
@@ -471,12 +673,120 @@ static ssize_t scd_show(struct device *dev, struct device_attribute *attr,
 }
 static DEVICE_ATTR_RO(scd);
 
+static ssize_t airmouse_show(struct device *dev, struct device_attribute *attr,
+			     char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return sysfs_emit(buf, "%u\n", drvdata->airmouse_enabled);
+}
+
+static ssize_t airmouse_store(struct device *dev, struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+	int val;
+
+	if (kstrtoint(buf, 0, &val) || (val != 0 && val != 1))
+		return -EINVAL;
+
+	lgmagic_set_airmouse(drvdata, val);
+	return count;
+}
+static DEVICE_ATTR_RW(airmouse);
+
+static ssize_t airmouse_threshold_show(struct device *dev,
+				       struct device_attribute *attr, char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return sysfs_emit(buf, "%lld\n",
+			  lgmagic_radps_to_degps(drvdata->airmouse.threshold));
+}
+
+static ssize_t airmouse_threshold_store(struct device *dev,
+					struct device_attribute *attr,
+					const char *buf, size_t count)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+	int val;
+
+	if (kstrtoint(buf, 0, &val) || val < 0 || val > LGMAGIC_THRESHOLD_MAX)
+		return -EINVAL;
+
+	drvdata->airmouse.threshold = lgmagic_degps_to_radps(val);
+	return count;
+}
+static DEVICE_ATTR_RW(airmouse_threshold);
+
+static ssize_t sensitivity_x_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return sysfs_emit(buf, "%lld\n",
+			  drvdata->airmouse.sensitivity_x / LGMAGIC_FP_ONE);
+}
+
+static ssize_t sensitivity_x_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+	int val;
+
+	if (kstrtoint(buf, 0, &val) || val < 0 || val > LGMAGIC_SENSITIVITY_MAX)
+		return -EINVAL;
+
+	drvdata->airmouse.sensitivity_x = (s64)val * LGMAGIC_FP_ONE;
+	return count;
+}
+static DEVICE_ATTR_RW(sensitivity_x);
+
+static ssize_t sensitivity_y_show(struct device *dev,
+				  struct device_attribute *attr, char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return sysfs_emit(buf, "%lld\n",
+			  drvdata->airmouse.sensitivity_y / LGMAGIC_FP_ONE);
+}
+
+static ssize_t sensitivity_y_store(struct device *dev,
+				   struct device_attribute *attr,
+				   const char *buf, size_t count)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+	int val;
+
+	if (kstrtoint(buf, 0, &val) || val < 0 || val > LGMAGIC_SENSITIVITY_MAX)
+		return -EINVAL;
+
+	drvdata->airmouse.sensitivity_y = (s64)val * LGMAGIC_FP_ONE;
+	return count;
+}
+static DEVICE_ATTR_RW(sensitivity_y);
+
+static ssize_t motion_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct lgmagic_drvdata *drvdata = hid_get_drvdata(to_hid_device(dev));
+
+	return sysfs_emit(buf, "%u\n", drvdata->motion_on);
+}
+static DEVICE_ATTR_RO(motion);
+
 static struct attribute *lgmagic_attrs[] = {
 	&dev_attr_fw_version.attr,
 	&dev_attr_fw_major.attr,
 	&dev_attr_fw_zone.attr,
 	&dev_attr_battery_level.attr,
 	&dev_attr_scd.attr,
+	&dev_attr_airmouse.attr,
+	&dev_attr_airmouse_threshold.attr,
+	&dev_attr_sensitivity_x.attr,
+	&dev_attr_sensitivity_y.attr,
+	&dev_attr_motion.attr,
 	NULL
 };
 
@@ -487,19 +797,17 @@ static const struct attribute_group lgmagic_group = {
 static void lgmagic_startup_commands(struct lgmagic_drvdata *drvdata)
 {
 	lgmagic_cmd_send(drvdata->hdev, LGMAGIC_CMD_FW_VER);
-	lgmagic_request_scd(drvdata);
-	lgmagic_cmd_send(drvdata->hdev, LGMAGIC_CMD_MOTION_ON);
+	if (!drvdata->scd_done)
+		lgmagic_request_scd(drvdata);
+	lgmagic_set_motion(drvdata, drvdata->airmouse_enabled);
 }
 
-/* A command issued as probe ends is answered about half the time. The
- * remote's first report proves the link carries traffic, so repeat there.
- */
-static void lgmagic_scd_retry_work(struct work_struct *work)
-{
+static void lgmagic_scd_retry_work(struct work_struct *work){
 	struct lgmagic_drvdata *drvdata =
 		container_of(work, struct lgmagic_drvdata, scd_retry.work);
 
-	if (drvdata->shutdown || drvdata->scd_done)
+	if (drvdata->shutdown || drvdata->scd_done ||
+	    drvdata->blob_valid)
 		return;
 
 	if (drvdata->scd_retries++ >= LGMAGIC_SCD_RETRIES)
@@ -515,6 +823,7 @@ static void lgmagic_scd_retry_work(struct work_struct *work)
 			      msecs_to_jiffies(LGMAGIC_SCD_RETRY_MS));
 }
 
+/* Probe commands are often missed; repeat once reports flow. */
 static void lgmagic_startup_work(struct work_struct *work)
 {
 	struct lgmagic_drvdata *drvdata;
@@ -526,7 +835,7 @@ static void lgmagic_startup_work(struct work_struct *work)
 
 	lgmagic_startup_commands(drvdata);
 
-	if (!drvdata->scd_done)
+	if (!drvdata->blob_valid && !drvdata->scd_done)
 		schedule_delayed_work(&drvdata->scd_retry,
 				      msecs_to_jiffies(LGMAGIC_SCD_RETRY_MS));
 }
@@ -545,31 +854,34 @@ static void lgmagic_calib_name(const char *uniq, char *out, size_t out_size)
 
 static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagic_drvdata *drvdata)
 {
-	int ret;
 	const struct firmware *fw;
+	s64 bias[3], scale[3];
+	int ret, i;
 
 	ret = request_firmware(&fw, fwname, dev);
 	if (ret)
 		return ret;
 
-	if (lgmagic_convert_calib(&drvdata->calib, fw->data, fw->size))
-	{
-		lgmagic_dev_warn(dev, "Calibration %s is not a supported fixed-point blob (run scripts/convert_calib.py for legacy float files)", fwname);
-		memset(&drvdata->calib, 0, sizeof(drvdata->calib));
-		release_firmware(fw);
-		return -EINVAL;
-	}
-
+	ret = lgmagic_parse_calib_phys(bias, scale, fw->data, fw->size);
 	release_firmware(fw);
 
-	if (lgmagic_validate_calib(&drvdata->calib))
+	if (ret)
 	{
-		lgmagic_dev_warn(dev, "Calibration %s isn't valid", fwname);
-		memset(&drvdata->calib, 0, sizeof(drvdata->calib));
-		return -EINVAL;
+		lgmagic_dev_warn(dev, "Calibration %s is invalid or has zero scale; falling back to SCD", fwname);
+		return ret;
 	}
 
-	lgmagic_dev_info(dev, "Loaded LG Magic calibration from %s", fwname);
+	for (i = 0; i < 3; i++)
+	{
+		drvdata->airmouse.gyro_bias[i] = bias[i];
+		drvdata->airmouse.gyro_matrix[i][i] = scale[i];
+	}
+
+	drvdata->airmouse.gyro_matrix_valid = 1;
+	drvdata->blob_valid = true;
+	drvdata->pointer_ready = true;
+
+	lgmagic_dev_info(dev, "Loaded LG Magic physical calibration from %s", fwname);
 
 	return 0;
 }
@@ -577,6 +889,7 @@ static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagi
 static int lgmagic_probe(struct hid_device *hdev, const struct hid_device_id *id)
 {
 	int ret, i;
+	unsigned long flags;
 	struct lgmagic_drvdata *drvdata;
 
 	drvdata = devm_kzalloc(&hdev->dev, sizeof(*drvdata), GFP_KERNEL);
@@ -585,6 +898,19 @@ static int lgmagic_probe(struct hid_device *hdev, const struct hid_device_id *id
 
 	hid_set_drvdata(hdev, drvdata);
 	drvdata->hdev = hdev;
+	lgmagic_airmouse_init(&drvdata->airmouse);
+	drvdata->airmouse_enabled = !!airmouse;
+	drvdata->airmouse.threshold =
+		lgmagic_degps_to_radps(lgmagic_clamp_param(airmouse_threshold,
+							   LGMAGIC_THRESHOLD_MAX));
+	drvdata->airmouse.sensitivity_x =
+		(s64)lgmagic_clamp_param(sensitivity_x,
+					 LGMAGIC_SENSITIVITY_MAX) *
+		LGMAGIC_FP_ONE;
+	drvdata->airmouse.sensitivity_y =
+		(s64)lgmagic_clamp_param(sensitivity_y,
+					 LGMAGIC_SENSITIVITY_MAX) *
+		LGMAGIC_FP_ONE;
 	INIT_WORK(&drvdata->startup, lgmagic_startup_work);
 	INIT_DELAYED_WORK(&drvdata->scd_retry, lgmagic_scd_retry_work);
 	spin_lock_init(&drvdata->lock);
@@ -608,6 +934,27 @@ static int lgmagic_probe(struct hid_device *hdev, const struct hid_device_id *id
 	}
 		lgmagic_load_fw("lg_magic_calib.bin", &hdev->dev, drvdata);
 loaded:
+
+	{
+		s64 cached_gyro[3][3], cached_accel[3][3], cached_remap[3][3];
+		s64 cached_scale;
+		u8 cached_raw[LGMAGIC_SCD_SIZE];
+
+		/* A cache hit means no new F9 17 request. */
+		if (lgmagic_scd_cache_lookup(hdev->uniq, cached_gyro,
+					     cached_accel, cached_remap,
+					     &cached_scale, cached_raw))
+		{
+			lgmagic_apply_scd_matrices(drvdata, cached_gyro,
+						   cached_accel, cached_remap,
+						   cached_scale);
+			spin_lock_irqsave(&drvdata->lock, flags);
+			memcpy(drvdata->scd, cached_raw, sizeof(cached_raw));
+			drvdata->scd_len = sizeof(cached_raw);
+			drvdata->scd_done = true;
+			spin_unlock_irqrestore(&drvdata->lock, flags);
+		}
+	}
 
 	drvdata->input_hid = devm_input_allocate_device(&hdev->dev);
 	if (!drvdata->input_hid)
