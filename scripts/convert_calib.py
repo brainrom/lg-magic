@@ -5,6 +5,10 @@ The kernel module only understands the versioned, little-endian fixed-point
 format defined below.  Values are signed 16.16 fixed-point numbers stored in
 32 bits.
 
+Only gyro_bias and gyro_scale are used by the kernel.  gyro_scale is stored in
+deg/s per count; the kernel converts it to rad/s.  alpha and mouse_k are
+accepted for compatibility but are ignored.
+
 Use --from-legacy to migrate a blob written by older versions of this script
 (8 native-endian IEEE-754 binary32 values).
 """
@@ -29,6 +33,8 @@ LEGACY_SIZE = 32
 
 GYRO_BIAS_LIMIT = 100.0
 GYRO_SCALE_LIMIT = 10.0
+DEFAULT_ALPHA = 0.0
+DEFAULT_MOUSE_K = 0.0
 
 assert BLOB_SIZE == 40
 
@@ -65,6 +71,14 @@ def _check_abs(name, value, limit):
     return value
 
 
+def _check_positive(name, value, limit):
+    value = float(value)
+    if not math.isfinite(value) or not 0.0 < value <= limit:
+        raise ValueError(
+            f"{name} must be finite and within (0, {limit:g}]: {value!r}")
+    return value
+
+
 def _check_unit(name, value):
     value = float(value)
     if not math.isfinite(value) or not 0.0 <= value <= 1.0:
@@ -72,7 +86,8 @@ def _check_unit(name, value):
     return value
 
 
-def build_blob(gyro_bias, gyro_scale, alpha, mouse_k):
+def build_blob(gyro_bias, gyro_scale, alpha=DEFAULT_ALPHA,
+               mouse_k=DEFAULT_MOUSE_K):
     """Build a version 1 calibration blob from float values."""
     if len(gyro_bias) != 3 or len(gyro_scale) != 3:
         raise ValueError("gyro_bias and gyro_scale must each contain exactly 3 values")
@@ -82,7 +97,7 @@ def build_blob(gyro_bias, gyro_scale, alpha, mouse_k):
         for i, value in enumerate(gyro_bias)
     ]
     values += [
-        _check_abs(f"gyro_scale[{i}]", value, GYRO_SCALE_LIMIT)
+        _check_positive(f"gyro_scale[{i}]", value, GYRO_SCALE_LIMIT)
         for i, value in enumerate(gyro_scale)
     ]
     values.append(_check_unit("alpha", alpha))
@@ -125,7 +140,7 @@ def parse_legacy_blob(data, byteorder="little"):
     return struct.unpack(endian + "3f3fff", data[:LEGACY_SIZE])
 
 
-def load_json_values(path, alpha, mouse_k):
+def load_json_values(path):
     with open(path, "r", encoding="utf-8") as source:
         data = json.load(source)
 
@@ -142,7 +157,7 @@ def load_json_values(path, alpha, mouse_k):
     if not isinstance(scale, list) or len(scale) != 3:
         raise ValueError("JSON: gyro.scale must contain exactly 3 values")
 
-    return bias, scale, alpha, mouse_k
+    return bias, scale
 
 
 def main(argv=None):
@@ -150,8 +165,12 @@ def main(argv=None):
         description="Convert airmouse calibration to the fixed-point kernel blob.")
     parser.add_argument("input_file", help="input JSON file, or legacy blob with --from-legacy")
     parser.add_argument("output_file", help="output calibration blob")
-    parser.add_argument("--alpha", type=float, help="low-pass filter coefficient (0.0-1.0)")
-    parser.add_argument("--mouse_k", type=float, help="airmouse sensitivity multiplier (0.0-1.0)")
+    parser.add_argument("--alpha", type=float,
+                        help="deprecated, ignored by the kernel (accepted for compatibility)")
+    parser.add_argument("--mouse_k", type=float,
+                        help="deprecated, ignored by the kernel (accepted for compatibility)")
+    parser.add_argument("--scale-unit", choices=("deg", "rad"), default="deg",
+                        help="unit of gyro.scale in JSON input (default: deg/s per count)")
     parser.add_argument("--from-legacy", action="store_true",
                         help="convert an old 8 x float32 blob instead of JSON")
     parser.add_argument("--legacy-endian", choices=("little", "big"), default="little",
@@ -161,23 +180,29 @@ def main(argv=None):
 
     try:
         if args.from_legacy:
-            if args.alpha is not None or args.mouse_k is not None:
-                raise ValueError("--alpha and --mouse_k cannot be used with --from-legacy")
+            if args.scale_unit != "deg":
+                raise ValueError("--scale-unit is only valid with JSON input")
 
             with open(args.input_file, "rb") as source:
                 values = parse_legacy_blob(source.read(), args.legacy_endian)
             gyro_bias = values[0:3]
             gyro_scale = values[3:6]
-            alpha = values[6]
-            mouse_k = values[7]
+            if values[6] or values[7]:
+                print("warning: legacy alpha/mouse_k are deprecated and ignored",
+                      file=sys.stderr)
         else:
-            if args.alpha is None or args.mouse_k is None:
-                raise ValueError("--alpha and --mouse_k are required for JSON input")
+            gyro_bias, gyro_scale = load_json_values(args.input_file)
+            if args.scale_unit == "rad":
+                gyro_scale = [math.degrees(value) for value in gyro_scale]
 
-            gyro_bias, gyro_scale, alpha, mouse_k = load_json_values(
-                args.input_file, args.alpha, args.mouse_k)
+        if args.alpha is not None or args.mouse_k is not None:
+            print("warning: alpha/mouse_k are deprecated and ignored; writing zeros",
+                  file=sys.stderr)
+        if all(float(value) == 0.0 for value in gyro_bias):
+            print("warning: gyro_bias is all zero; the kernel will not "
+                  "auto-estimate bias when a blob is present", file=sys.stderr)
 
-        blob = build_blob(gyro_bias, gyro_scale, alpha, mouse_k)
+        blob = build_blob(gyro_bias, gyro_scale)
 
         with open(args.output_file, "wb") as output:
             output.write(blob)

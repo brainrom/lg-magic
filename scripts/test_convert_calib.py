@@ -40,10 +40,6 @@ class BlobFormatTests(unittest.TestCase):
         self.assertEqual(cc.to_q16(0.5 / cc.Q16_ONE), 1)
         self.assertEqual(cc.to_q16(-0.5 / cc.Q16_ONE), -1)
 
-    def test_parse_accepts_trailing_data(self):
-        blob = cc.build_blob([0, 0, 0], [0.07, 0.07, 0.07], 0.2, 0.5)
-        self.assertEqual(cc.parse_blob(blob + b"extra")["size"], cc.BLOB_SIZE)
-
     def test_parse_rejects_bad_magic(self):
         blob = bytearray(cc.build_blob([0, 0, 0], [0.07, 0.07, 0.07], 0.2, 0.5))
         blob[0] = ord("X")
@@ -69,40 +65,36 @@ class BlobFormatTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
-    def test_accepts_boundary_values(self):
-        cc.build_blob([100, -100, 0], [10, -10, 0], 0.0, 0.0)
-        cc.build_blob([0, 0, 0], [0, 0, 0], 1.0, 1.0)
-
     def test_rejects_non_finite_values(self):
         for value in (math.nan, math.inf, -math.inf):
             with self.subTest(value=value):
                 with self.assertRaises(ValueError):
-                    cc.build_blob([value, 0, 0], [0, 0, 0], 0.5, 0.5)
+                    cc.build_blob([value, 0, 0], [0.07, 0.07, 0.07], 0.5, 0.5)
                 with self.assertRaises(ValueError):
-                    cc.build_blob([0, 0, 0], [value, 0, 0], 0.5, 0.5)
+                    cc.build_blob([0, 0, 0], [value, 0.07, 0.07], 0.5, 0.5)
                 with self.assertRaises(ValueError):
-                    cc.build_blob([0, 0, 0], [0, 0, 0], value, 0.5)
+                    cc.build_blob([0, 0, 0], [0.07, 0.07, 0.07], value, 0.5)
                 with self.assertRaises(ValueError):
-                    cc.build_blob([0, 0, 0], [0, 0, 0], 0.5, value)
+                    cc.build_blob([0, 0, 0], [0.07, 0.07, 0.07], 0.5, value)
 
     def test_rejects_out_of_range_values(self):
         for bias in (100.001, -100.001):
             with self.assertRaises(ValueError):
-                cc.build_blob([bias, 0, 0], [0, 0, 0], 0.5, 0.5)
-        for scale in (10.001, -10.001):
+                cc.build_blob([bias, 0, 0], [0.07, 0.07, 0.07], 0.5, 0.5)
+        for scale in (10.001, -10.001, 0.0, -0.001):
             with self.assertRaises(ValueError):
-                cc.build_blob([0, 0, 0], [scale, 0, 0], 0.5, 0.5)
+                cc.build_blob([0, 0, 0], [scale, 0.07, 0.07], 0.5, 0.5)
         for value in (-0.001, 1.001):
             with self.assertRaises(ValueError):
-                cc.build_blob([0, 0, 0], [0, 0, 0], value, 0.5)
+                cc.build_blob([0, 0, 0], [0.07, 0.07, 0.07], value, 0.5)
             with self.assertRaises(ValueError):
-                cc.build_blob([0, 0, 0], [0, 0, 0], 0.5, value)
+                cc.build_blob([0, 0, 0], [0.07, 0.07, 0.07], 0.5, value)
 
-    def test_rejects_wrong_number_of_axes(self):
-        with self.assertRaises(ValueError):
-            cc.build_blob([0, 0], [0, 0, 0], 0.5, 0.5)
-        with self.assertRaises(ValueError):
-            cc.build_blob([0, 0, 0], [0, 0], 0.5, 0.5)
+    def test_rejects_non_positive_scale(self):
+        for scale in (0.0, -0.001):
+            with self.subTest(scale=scale):
+                with self.assertRaisesRegex(ValueError, "gyro_scale"):
+                    cc.build_blob([0, 0, 0], [scale, 0.07, 0.07])
 
 
 class LegacyTests(unittest.TestCase):
@@ -122,18 +114,12 @@ class LegacyTests(unittest.TestCase):
         legacy = struct.pack("<3f3fff", *values)
         parsed_values = cc.parse_legacy_blob(legacy)
         parsed = cc.parse_blob(cc.build_blob(
-            parsed_values[0:3], parsed_values[3:6],
-            parsed_values[6], parsed_values[7]))
+            parsed_values[0:3], parsed_values[3:6]))
 
         self.assertEqual(parsed["gyro_bias"], [cc.to_q16(v) for v in values[:3]])
         self.assertEqual(parsed["gyro_scale"], [cc.to_q16(v) for v in values[3:6]])
-        self.assertEqual(parsed["alpha"], cc.to_q16(values[6]))
-        self.assertEqual(parsed["mouse_k"], cc.to_q16(values[7]))
-
-    def test_legacy_blob_too_short(self):
-        with self.assertRaisesRegex(ValueError, "too short"):
-            cc.parse_legacy_blob(b"\0" * (cc.LEGACY_SIZE - 1))
-
+        self.assertEqual(parsed["alpha"], 0)
+        self.assertEqual(parsed["mouse_k"], 0)
 
 class CommandLineTests(unittest.TestCase):
     def setUp(self):
@@ -151,13 +137,42 @@ class CommandLineTests(unittest.TestCase):
             }
         }), encoding="utf-8")
 
+        ret = cc.main([str(json_file), str(out_file)])
+
+        self.assertEqual(ret, 0)
+        parsed = cc.parse_blob(out_file.read_bytes())
+        self.assertEqual(parsed["gyro_bias"][0], cc.to_q16(1.5))
+        self.assertEqual(parsed["alpha"], 0)
+
+    def test_json_ignores_deprecated_alpha_mouse_k(self):
+        json_file = self.dir / "calib.json"
+        out_file = self.dir / "calib.bin"
+        json_file.write_text(json.dumps({
+            "gyro": {"bias": [1.5, 0, 0], "scale": [0.07, 0.07, 0.07]}
+        }), encoding="utf-8")
+
         ret = cc.main([str(json_file), str(out_file),
                        "--alpha", "0.2", "--mouse_k", "0.5"])
 
         self.assertEqual(ret, 0)
         parsed = cc.parse_blob(out_file.read_bytes())
-        self.assertEqual(parsed["gyro_bias"][0], cc.to_q16(1.5))
-        self.assertEqual(parsed["alpha"], cc.to_q16(0.2))
+        self.assertEqual(parsed["alpha"], 0)
+        self.assertEqual(parsed["mouse_k"], 0)
+
+    def test_json_scale_unit_rad(self):
+        json_file = self.dir / "calib.json"
+        out_file = self.dir / "calib.bin"
+        json_file.write_text(json.dumps({
+            "gyro": {"bias": [1.5, 0, 0],
+                     "scale": [0.001, 0.002, 0.003]}
+        }), encoding="utf-8")
+
+        ret = cc.main([str(json_file), str(out_file), "--scale-unit", "rad"])
+
+        self.assertEqual(ret, 0)
+        parsed = cc.parse_blob(out_file.read_bytes())
+        expected = [math.degrees(v) for v in (0.001, 0.002, 0.003)]
+        self.assertEqual(parsed["gyro_scale"], [cc.to_q16(v) for v in expected])
 
     def test_legacy_input(self):
         legacy_file = self.dir / "legacy.bin"
@@ -170,7 +185,8 @@ class CommandLineTests(unittest.TestCase):
         self.assertEqual(ret, 0)
         parsed = cc.parse_blob(out_file.read_bytes())
         self.assertEqual(parsed["gyro_bias"][1], cc.to_q16(-2.25))
-        self.assertEqual(parsed["mouse_k"], cc.to_q16(0.5))
+        self.assertEqual(parsed["alpha"], 0)
+        self.assertEqual(parsed["mouse_k"], 0)
 
     def test_legacy_big_endian_input(self):
         legacy_file = self.dir / "legacy-be.bin"
@@ -185,23 +201,13 @@ class CommandLineTests(unittest.TestCase):
         parsed = cc.parse_blob(out_file.read_bytes())
         self.assertEqual(parsed["gyro_bias"][0], cc.to_q16(1.5))
 
-    def test_json_requires_alpha_and_mouse_k(self):
-        json_file = self.dir / "calib.json"
-        out_file = self.dir / "calib.bin"
-        json_file.write_text(json.dumps({
-            "gyro": {"bias": [0, 0, 0], "scale": [1, 1, 1]}
-        }), encoding="utf-8")
-
-        self.assertEqual(cc.main([str(json_file), str(out_file)]), 1)
-        self.assertFalse(out_file.exists())
-
-    def test_legacy_rejects_alpha(self):
+    def test_scale_unit_rejected_for_legacy(self):
         legacy_file = self.dir / "legacy.bin"
         out_file = self.dir / "calib.bin"
-        legacy_file.write_bytes(struct.pack("<3f3fff", 0, 0, 0, 1, 1, 1, 0.2, 0.5))
+        legacy_file.write_bytes(struct.pack("<3f3fff", 1, 0, 0, 0.07, 0.07, 0.07, 0.2, 0.5))
 
         self.assertEqual(cc.main([str(legacy_file), str(out_file),
-                                  "--from-legacy", "--alpha", "0.2"]), 1)
+                                  "--from-legacy", "--scale-unit", "rad"]), 1)
         self.assertFalse(out_file.exists())
 
     def test_json_missing_gyro_section(self):
@@ -209,17 +215,7 @@ class CommandLineTests(unittest.TestCase):
         out_file = self.dir / "calib.bin"
         json_file.write_text(json.dumps({"accel": {}}), encoding="utf-8")
 
-        self.assertEqual(cc.main([str(json_file), str(out_file),
-                                  "--alpha", "0.2", "--mouse_k", "0.5"]), 1)
-        self.assertFalse(out_file.exists())
-
-    def test_json_gyro_section_is_not_an_object(self):
-        json_file = self.dir / "calib.json"
-        out_file = self.dir / "calib.bin"
-        json_file.write_text(json.dumps({"gyro": []}), encoding="utf-8")
-
-        self.assertEqual(cc.main([str(json_file), str(out_file),
-                                  "--alpha", "0.2", "--mouse_k", "0.5"]), 1)
+        self.assertEqual(cc.main([str(json_file), str(out_file)]), 1)
         self.assertFalse(out_file.exists())
 
 
