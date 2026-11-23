@@ -67,6 +67,7 @@ struct lgmagic_drvdata {
 	struct delayed_work scd_retry;
 	unsigned int scd_retries;
 	bool started;
+	bool shutdown;
 
 	spinlock_t lock;
 	u8 fw_ver[LGMAGIC_FW_VER_MAX];
@@ -498,7 +499,7 @@ static void lgmagic_scd_retry_work(struct work_struct *work)
 	struct lgmagic_drvdata *drvdata =
 		container_of(work, struct lgmagic_drvdata, scd_retry.work);
 
-	if (drvdata->scd_done)
+	if (drvdata->shutdown || drvdata->scd_done)
 		return;
 
 	if (drvdata->scd_retries++ >= LGMAGIC_SCD_RETRIES)
@@ -519,6 +520,9 @@ static void lgmagic_startup_work(struct work_struct *work)
 	struct lgmagic_drvdata *drvdata;
 
 	drvdata = container_of(work, struct lgmagic_drvdata, startup);
+
+	if (drvdata->shutdown)
+		return;
 
 	lgmagic_startup_commands(drvdata);
 
@@ -664,6 +668,7 @@ static void lgmagic_remove(struct hid_device *hdev)
 {
 	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
 
+	drvdata->shutdown = true;
 	cancel_delayed_work_sync(&drvdata->scd_retry);
 	cancel_work_sync(&drvdata->startup);
 	hid_hw_stop(hdev);
