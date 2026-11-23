@@ -19,6 +19,7 @@
 #include <linux/input.h>
 #include <linux/firmware.h>
 #include <linux/errno.h>
+#include <linux/jiffies.h>
 #include <linux/spinlock.h>
 #include <linux/sysfs.h>
 #include <linux/workqueue.h>
@@ -55,12 +56,16 @@ MODULE_PARM_DESC(imu_evdev, "Expose raw IMU");
 
 #define LGMAGIC_SCD_MAX 512
 #define LGMAGIC_FW_VER_MAX 32
+#define LGMAGIC_SCD_RETRIES 3
+#define LGMAGIC_SCD_RETRY_MS 1000
 
 struct lgmagic_drvdata {
 	struct input_dev *input_hid;
 	struct input_dev *input_imu;
 	struct hid_device *hdev;
 	struct work_struct startup;
+	struct delayed_work scd_retry;
+	unsigned int scd_retries;
 	bool started;
 
 	spinlock_t lock;
@@ -69,6 +74,7 @@ struct lgmagic_drvdata {
 	u8 scd[LGMAGIC_SCD_MAX];
 	size_t scd_len;
 	bool scd_done;
+	bool scd_expected;
 	u8 fw_major;
 	u8 fw_zone;
 	u8 battery;
@@ -147,6 +153,24 @@ static int lgmagic_cmd_send(struct hid_device *hdev, u8 opcode)
 	return ret < 0 ? ret : -EIO;
 }
 
+/*
+ * Start a fresh SCD transfer.  The remote answers F9 17 with a sequence of
+ * chunks; a new request discards a previous partial transfer so a stale
+ * response cannot be appended to the new one.
+ */
+static void lgmagic_request_scd(struct lgmagic_drvdata *drvdata)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&drvdata->lock, flags);
+	drvdata->scd_len = 0;
+	drvdata->scd_done = false;
+	drvdata->scd_expected = true;
+	spin_unlock_irqrestore(&drvdata->lock, flags);
+
+	lgmagic_cmd_send(drvdata->hdev, LGMAGIC_CMD_SCD);
+}
+
 static void lgmagic_fw_version(struct hid_device *hdev, u8 *data, int size)
 {
 	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
@@ -170,13 +194,15 @@ static void lgmagic_fw_version(struct hid_device *hdev, u8 *data, int size)
 }
 
 /* The remote reuses one transmit buffer, so everything past data[3] bytes
- * is the previous frame and must not be stored.
+ * is the previous frame and must not be stored.  Only chunks belonging to an
+ * outstanding F9 17 request are accepted.
  */
 static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
 {
 	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
 	unsigned long flags;
-	size_t len;
+	size_t len, total;
+	bool complete = false;
 
 	if (size < 4)
 		return;
@@ -184,15 +210,31 @@ static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
 	len = min_t(size_t, data[3], size - 4);
 
 	spin_lock_irqsave(&drvdata->lock, flags);
-	if (drvdata->scd_done)
-		drvdata->scd_len = 0;
-	drvdata->scd_done = !data[2];
+	if (!drvdata->scd_expected)
+	{
+		spin_unlock_irqrestore(&drvdata->lock, flags);
+		lgmagic_dev_dbg(&hdev->dev, "Unexpected SCD chunk, %zu bytes",
+				len);
+		return;
+	}
+
 	len = min_t(size_t, len, LGMAGIC_SCD_MAX - drvdata->scd_len);
 	memcpy(drvdata->scd + drvdata->scd_len, data + 4, len);
 	drvdata->scd_len += len;
+	total = drvdata->scd_len;
+
+	if (!data[2])
+	{
+		drvdata->scd_expected = false;
+		drvdata->scd_done = true;
+		complete = true;
+	}
 	spin_unlock_irqrestore(&drvdata->lock, flags);
 
 	lgmagic_dev_dbg(&hdev->dev, "SCD %zu bytes, more %u", len, data[2]);
+
+	if (complete)
+		lgmagic_dev_info(&hdev->dev, "SCD complete: %zu bytes", total);
 }
 
 static void lgmagic_cmd_response(struct hid_device *hdev, u8 *data, int size)
@@ -441,23 +483,48 @@ static const struct attribute_group lgmagic_group = {
 	.attrs = lgmagic_attrs,
 };
 
-static void lgmagic_startup_commands(struct hid_device *hdev)
+static void lgmagic_startup_commands(struct lgmagic_drvdata *drvdata)
 {
-	lgmagic_cmd_send(hdev, LGMAGIC_CMD_FW_VER);
-	lgmagic_cmd_send(hdev, LGMAGIC_CMD_SCD);
-	lgmagic_cmd_send(hdev, LGMAGIC_CMD_MOTION_ON);
+	lgmagic_cmd_send(drvdata->hdev, LGMAGIC_CMD_FW_VER);
+	lgmagic_request_scd(drvdata);
+	lgmagic_cmd_send(drvdata->hdev, LGMAGIC_CMD_MOTION_ON);
 }
 
 /* A command issued as probe ends is answered about half the time. The
  * remote's first report proves the link carries traffic, so repeat there.
  */
+static void lgmagic_scd_retry_work(struct work_struct *work)
+{
+	struct lgmagic_drvdata *drvdata =
+		container_of(work, struct lgmagic_drvdata, scd_retry.work);
+
+	if (drvdata->scd_done)
+		return;
+
+	if (drvdata->scd_retries++ >= LGMAGIC_SCD_RETRIES)
+	{
+		lgmagic_dev_warn(&drvdata->hdev->dev,
+				 "No SCD response after %u retries",
+				 LGMAGIC_SCD_RETRIES);
+		return;
+	}
+
+	lgmagic_request_scd(drvdata);
+	schedule_delayed_work(&drvdata->scd_retry,
+			      msecs_to_jiffies(LGMAGIC_SCD_RETRY_MS));
+}
+
 static void lgmagic_startup_work(struct work_struct *work)
 {
 	struct lgmagic_drvdata *drvdata;
 
 	drvdata = container_of(work, struct lgmagic_drvdata, startup);
 
-	lgmagic_startup_commands(drvdata->hdev);
+	lgmagic_startup_commands(drvdata);
+
+	if (!drvdata->scd_done)
+		schedule_delayed_work(&drvdata->scd_retry,
+				      msecs_to_jiffies(LGMAGIC_SCD_RETRY_MS));
 }
 
 static void lgmagic_sanitize_mac(const char *uniq, char *out)
@@ -514,6 +581,7 @@ static int lgmagic_probe(struct hid_device *hdev, const struct hid_device_id *id
 	hid_set_drvdata(hdev, drvdata);
 	drvdata->hdev = hdev;
 	INIT_WORK(&drvdata->startup, lgmagic_startup_work);
+	INIT_DELAYED_WORK(&drvdata->scd_retry, lgmagic_scd_retry_work);
 	spin_lock_init(&drvdata->lock);
 
 	ret = hid_parse(hdev);
@@ -587,7 +655,7 @@ loaded:
 	if (ret)
 		return ret;
 
-	lgmagic_startup_commands(hdev);
+	lgmagic_startup_commands(drvdata);
 
 	return 0;
 }
@@ -596,6 +664,7 @@ static void lgmagic_remove(struct hid_device *hdev)
 {
 	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
 
+	cancel_delayed_work_sync(&drvdata->scd_retry);
 	cancel_work_sync(&drvdata->startup);
 	hid_hw_stop(hdev);
 }
