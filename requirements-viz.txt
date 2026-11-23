@@ -1,0 +1,8 @@
+# Optional visualization / AHRS extras for display_imu.py --ahrs/--cube.
+# Not needed for capture or the kernel air mouse.
+#
+# pyqtgraph.opengl needs PyOpenGL (provided by the [opengl] extra) and a Qt
+# binding.  PySide6 is used here; swap for PyQt5/PyQt6 if you prefer.
+ahrs>=0.4
+pyqtgraph[opengl]>=0.13
+PySide6>=6.7

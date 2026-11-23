@@ -1,0 +1,10 @@
+# Core dependencies for the host-side scripts (capture and visualization).
+# Tested with Python 3.14 on Arch.
+numpy>=2.0
+evdev>=1.7
+
+# The historical display_imu.py --mouse path additionally needs python-uinput.
+# Install it manually if you want to run that experiment.
+
+# Required by scripts/calibrate.py (accelerometer least-squares fit).
+scipy>=1.13
