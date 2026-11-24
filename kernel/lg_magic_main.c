@@ -131,7 +131,7 @@ static const struct {
 	u16 code;
 	u16 keycode;
 } lg_btn_map[] = {
-	{ 0x8000, KEY_POWER },
+	//{ 0x????, KEY_POWER }, On LG's AN-MR19BA the power button is strictly an IR button?
 	{ 0x8099, KEY_SLEEP },
 	{ 0x8010, KEY_0 }, { 0x8011, KEY_1 }, { 0x8012, KEY_2 },
 	{ 0x8013, KEY_3 }, { 0x8014, KEY_4 }, { 0x8015, KEY_5 },
@@ -151,7 +151,7 @@ static const struct {
 	{ 0x805D, KEY_MEDIA }, // IVI
 	{ 0x800B, KEY_TV },
 	{ 0x8098, KEY_CONTEXT_MENU }, // STB MENU
-	//{ 0x8000, KEY_CHANNELUP }, // Somehow it collides with power button
+	{ 0x8000, KEY_CHANNELUP },
 	{ 0x8001, KEY_CHANNELDOWN },
 	{ 0x8072, KEY_RED },
 	{ 0x8071, KEY_GREEN },
