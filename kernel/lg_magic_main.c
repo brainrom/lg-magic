@@ -127,44 +127,56 @@ struct lgmagic_drvdata {
 
 #define LGMAGIC_CODE_WHEEL 0x8044
 
+/*
+ * Streaming shortcuts are mapped by physical button position, not by
+ * service: different remotes put IVI or Netflix on the same button, so
+ * both codes report the same KEY_PROG* code.
+ */
 static const struct {
 	u16 code;
 	u16 keycode;
 } lg_btn_map[] = {
-	//{ 0x????, KEY_POWER }, On LG's AN-MR19BA the power button is strictly an IR button?
 	{ 0x8099, KEY_SLEEP },
 	{ 0x8010, KEY_0 }, { 0x8011, KEY_1 }, { 0x8012, KEY_2 },
 	{ 0x8013, KEY_3 }, { 0x8014, KEY_4 }, { 0x8015, KEY_5 },
 	{ 0x8016, KEY_6 }, { 0x8017, KEY_7 }, { 0x8018, KEY_8 }, { 0x8019, KEY_9 },
 	{ LGMAGIC_CODE_WHEEL, KEY_ENTER },
 	{ LGMAGIC_CODE_WHEEL, BTN_LEFT },
-	{ 0x8053, KEY_LIST },
-	{ 0x8045, KEY_MENU }, // ... button
+	{ 0x8000, KEY_CHANNELUP }, // POWER is IR-only and cannot be told apart over Bluetooth
+	{ 0x8001, KEY_CHANNELDOWN },
 	{ 0x8002, KEY_VOLUMEUP },
 	{ 0x8003, KEY_VOLUMEDOWN },
-	{ 0x8009, KEY_MUTE },
-	{ 0x808B, KEY_VOICECOMMAND },
-	{ 0x807C, KEY_HOME },
-	{ 0x8043, KEY_SETUP },
-	{ 0x804C, KEY_LIST }, // List button on MR19
-	{ 0x8028, KEY_BACK },
-	{ 0x80AB, KEY_PROGRAM },
-	{ 0x805D, KEY_MEDIA }, // IVI
-	{ 0x800B, KEY_TV },
-	{ 0x8098, KEY_CONTEXT_MENU }, // STB MENU
-	{ 0x8000, KEY_CHANNELUP },
-	{ 0x8001, KEY_CHANNELDOWN },
-	{ 0x8072, KEY_RED },
-	{ 0x8071, KEY_GREEN },
-	{ 0x8063, KEY_YELLOW },
-	{ 0x8061, KEY_BLUE },
-	{ 0x8081, KEY_VIDEO }, // MOVIES
-	{ 0x80B0, KEY_PLAY },
-	{ 0x80BA, KEY_PAUSE },
-	{ 0x8040, KEY_UP },
-	{ 0x8041, KEY_DOWN },
 	{ 0x8006, KEY_RIGHT },
 	{ 0x8007, KEY_LEFT },
+	{ 0x8009, KEY_MUTE },
+	{ 0x800B, KEY_SWITCHVIDEOMODE }, // Input/source
+	{ 0x80A1, KEY_SWITCHVIDEOMODE }, // Input/source
+	{ 0x8024, KEY_PROG4 }, // YouTube
+	{ 0x8028, KEY_BACK },
+	{ 0x8029, KEY_FAVORITES }, // Heart button
+	{ 0x8031, KEY_PROG3 }, // Disney
+	{ 0x8040, KEY_UP },
+	{ 0x8041, KEY_DOWN },
+	{ 0x8043, KEY_SETUP },
+	{ 0x8045, KEY_MENU }, // ... button
+	{ 0x8048, KEY_CHANNEL }, // LG Channels
+	{ 0x804C, KEY_LIST }, // List button on MR19, 0x8053 on MR20
+	{ 0x8053, KEY_LIST }, // List button on MR20
+	{ 0x8056, KEY_PROG1 }, // Netflix; IVI shares this button
+	{ 0x805C, KEY_PROG2 }, // Amazon Prime
+	{ 0x805D, KEY_PROG1 }, // IVI; Netflix shares this button
+	{ 0x8061, KEY_BLUE },
+	{ 0x8063, KEY_YELLOW },
+	{ 0x8071, KEY_GREEN },
+	{ 0x8072, KEY_RED },
+	{ 0x807B, KEY_NEWS }, // News
+	{ 0x807C, KEY_HOME },
+	{ 0x8081, KEY_VIDEO }, // MOVIES
+	{ 0x8098, KEY_CONTEXT_MENU }, // STB MENU
+	{ 0x80AB, KEY_PROGRAM },
+	{ 0x808B, KEY_VOICECOMMAND },
+	{ 0x80B0, KEY_PLAY },
+	{ 0x80BA, KEY_PAUSE },
 };
 
 static int lgmagic_cmd_send(struct hid_device *hdev, u8 opcode)
@@ -1026,7 +1038,7 @@ static void lgmagic_remove(struct hid_device *hdev)
 }
 
 static const struct hid_device_id lgmagic_devices[] = {
-	{ HID_BLUETOOTH_DEVICE(0x000f, 0x3412) }, // LG Magic Remote
+	{ HID_BLUETOOTH_DEVICE(0x000f, 0x3412) }, // LG Magic Remote MR19/MR20
 	{ }
 };
 MODULE_DEVICE_TABLE(hid, lgmagic_devices);
