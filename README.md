@@ -1,128 +1,63 @@
-# LG Magic Remote (MR20) Linux Kernel Driver and Tools
+# LG Magic Remote (MR20) Linux Kernel Driver
+
 **Language:** **English🇬🇧** [Русский🇷🇺](README.ru.md)
 
 ![LG Magic Remote](images/lg_magic_remote.png)
 
 ## Overview
 
-This project provides a comprehensive Linux kernel driver and toolset for the LG Magic Remote (MR20 and similar models). The driver enables full functionality of the remote including button mapping, gyroscopic airmouse control, and IMU data access. The package includes both a kernel module and Python utilities for calibration, testing, and visualization.
+A Linux kernel driver for the LG Magic Remote (MR20 and similar models). It
+provides button mapping, pointer control and raw IMU access, with an optional
+voice-input subproject.
 
-## Project Structure
+## Features
 
-### Kernel Module Files
+### Buttons
 
-- **kernel/dkms.conf** - DKMS configuration file for automated kernel module building
-- **kernel/lg_magic_main.c** - Main kernel driver implementation
-- **kernel/lg_magic_airmouse.h** - Header file for airmouse calibration structures
-- **kernel/lg_magic_airmouse.c** - Airmouse calibration and filtering implementation
-- **kernel/Makefile** - Build system for the kernel module
-- **51-lgimu.rules** - Udev rule for non-root raw IMU access. Place to `/etc/udev/rules.d/` if needed.
+Number keys, navigation, media controls, colour buttons and function keys. In
+button mode the wheel acts as UP/DOWN.
 
-### Voice Subproject
+### Air mouse
 
-- **voice/** - Optional microphone support: privileged `lgmagicd`, WirePlumber
-  PipeWire source module and optional FIFO fallback. See
-  [voice/README.md](voice/README.md) for architecture, D-Bus API, arm events,
-  security model and the detailed file list.
+The air mouse works without additional calibration: the driver uses the
+remote's SCD (Sensor Calibration Data) and estimates the gyro bias at runtime.
+Shaking the remote enables pointer mode. In pointer mode the wheel reports
+normal scroll events and the wheel button is `BTN_LEFT`. Pressing any button
+other than the wheel button returns to button mode.
 
-### Python Tools
+Sensitivity and the shake threshold can be tuned per device. An optional
+per-unit calibration blob is available for higher precision. See
+[docs/airmouse.md](docs/airmouse.md).
 
-- **scripts/capture_imu.py** - Raw IMU capture for calibration (requires only python-evdev)
-- **scripts/imu_reader.py** - Shared evdev reader for capture and display
-- **scripts/lg_magic.py** - HIDRAW-level packet analyzer and debug tool. Initial tool, kept for historical reasons
-- **scripts/calibrate.py** - IMU calibration utility (accelerometer and gyroscope)
-- **scripts/convert_calib.py** - Converts JSON or legacy float calibration to the fixed-point format used by the kernel module
-- **scripts/test_convert_calib.py** - Tests for the calibration converter
-- **scripts/display_imu.py** - Real-time IMU data visualization and airmouse emulation
+### IMU data
 
-## Kernel Module Features
+Raw data from the inertial measurement unit (IMU) — accelerometer and
+gyroscope — is exposed as a separate input device when the module is loaded
+with `imu_evdev=1`.
 
-### Device Support
-- Supports LG Magic Remote (HID Bluetooth device 000f:3412)
-- Creates two input devices:
-  - `LG Magic Remote` - Standard HID events (buttons, wheel, airmouse)
-  - `LG Magic Remote IMU` - Raw IMU data (accelerometer + gyroscope)
+### Voice input
 
-### Button Mapping
-Comprehensive button support including:
-- Power, number keys (0-9), navigation buttons (UP/DOWN/LEFT/RIGHT)
-- Media controls (PLAY, PAUSE, VOLUME, MUTE)
-- Color buttons (RED, GREEN, YELLOW, BLUE)
-- Special function buttons (HOME, BACK, SETTINGS, GUIDE)
+Optional microphone support: a privileged service, a WirePlumber/PipeWire
+source and an optional FIFO. See [voice/README.md](voice/README.md) for
+installation and architecture.
 
-### Device Interrogation
-- Motion streaming is enabled when the remote connects with the vendor command
-  `F9 01`; an MR22 streams motion even without it
-- Firmware version, region zone and the remote's own sensor calibration blob
-  (SCD) are requested at probe and exposed through sysfs
-- Battery level is decoded from the upper six bits of report byte 3
-
-### Airmouse Functionality
-**Needs calibration before usage**
-- Gyroscope-based pointer control
-- Configurable sensitivity and threshold
-- Low-pass filtering for smooth movement
-- Automatic mode switching between navigation and pointer control
-
-The airmouse feature is implemented in two ways:
-- **Kernel Module (Production)**: Built-in airmouse processing with minimal latency, running entirely in kernel space
-- **Python + Uinput (Debug)**: Raw IMU data processing in userspace via `display_imu.py --mouse` for testing and calibration validation
-
-### IMU Data Access
-- Raw accelerometer and gyroscope data via evdev
-- 6-axis motion data (3-axis accel + 3-axis gyro)
-- Hardware counter for timing synchronization
-
-### Voice Input
-
-The remote microphone is a vendor HID stream, not a standard ALSA or HFP
-device. The optional [voice/](voice/README.md) subproject handles it:
-
-- `lgmagicd` is the privileged daemon. It is the only process that opens the
-  remote's hidraw node, arms the microphone on a physical button press,
-  decodes mSBC and passes a read-only PCM pipe to the session over D-Bus.
-- `libpipewire-module-lgmagic.so` is loaded by WirePlumber as a
-  `pw-module-client` component and publishes the `lg-magic-voice` source.
-  Applications use PipeWire; they never see hidraw and cannot arm the
-  microphone.
-- An optional FIFO fallback exists for simple installations that do not want
-  the WirePlumber module. It is a separate, group-based transport with its own
-  security trade-offs.
-
-Install the default D-Bus + WirePlumber path:
-
-```bash
-make -C voice
-sudo make -C voice install
-sudo systemd-sysusers
-sudo udevadm control --reload && sudo udevadm trigger
-sudo systemctl daemon-reload
-sudo systemctl reload dbus
-sudo systemctl enable --now lgmagicd
-systemctl --user restart wireplumber
-wpctl status
-```
-
-The source is named `lg-magic-voice` and is deliberately low priority, so it
-does not become the default microphone automatically. See
-[voice/README.md](voice/README.md) for the D-Bus interface, arm-event
-side-channel, FIFO fallback, security model, testing and detailed file list.
-
-## Building and Installation
+## Installation
 
 ### Prerequisites
-- Linux kernel headers
-- DKMS (Dynamic Kernel Module Support)
-- Build essentials (make, gcc)
-- For optional voice support, see [voice/README.md](voice/README.md)
 
-### Manual Build
+- Linux kernel headers
+- DKMS (for the DKMS installation)
+- Build tools (`make`, `gcc`)
+
+### Manual build
+
 ```bash
-make
-sudo insmod lg_magic.ko
+make -C kernel
+sudo insmod kernel/lg_magic.ko
 ```
 
-### DKMS Installation
+### DKMS
+
 ```bash
 sudo mkdir /usr/src/lg-magic-1.0
 sudo cp * /usr/src/lg-magic-1.0/
@@ -131,246 +66,73 @@ sudo dkms build -m lg-magic -v 1.0
 sudo dkms install -m lg-magic -v 1.0
 ```
 
-### Module Parameters
-The driver supports several runtime parameters:
+## Configuration
+
+### Module parameters
+
+These are **probe-time defaults**. They are copied into each device when it
+probes; use the per-device sysfs attributes for runtime tuning.
 
 ```bash
-# Load with custom parameters
-sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 imu_evdev=1 debug=2
-
-# Or set via sysfs after loading
-echo 1 > /sys/module/lg_magic/parameters/airmouse
-echo 500 > /sys/module/lg_magic/parameters/airmouse_threshold
-echo 2 > /sys/module/lg_magic/parameters/debug
+sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 \
+    sensitivity_x=600 sensitivity_y=600 imu_evdev=1 debug=2
 ```
 
-**Parameters:**
-- `airmouse` (0/1): Enable/disable airmouse functionality
-- `airmouse_threshold` (int): Gyro threshold for enabling airmouse (default: 300)
-- `imu_evdev` (0/1): Expose raw IMU data as separate input device
-- `debug` (0-2): Debug message level (0=quiet, 1=normal, 2=verbose)
+| Parameter | Units | Default | Meaning |
+|---|---|---|---|
+| `airmouse` | 0/1 | 1 | Enable pointer mode at probe |
+| `airmouse_threshold` | deg/s | 300 | Shake threshold that enters pointer mode |
+| `sensitivity_x` | px/rad | 600 | Horizontal cursor sensitivity |
+| `sensitivity_y` | px/rad | 600 | Vertical cursor sensitivity |
+| `imu_evdev` | 0/1 | 0 | Expose raw IMU data as an input device |
+| `debug` | 0-2 | 1 | Kernel module debug output level |
 
-### Sysfs Attributes
+### Sysfs
 
-Under the HID device directory, for example
-`/sys/bus/hid/devices/0005:000F:3412.*/`:
-
-- `fw_version`: the firmware payload of the `F9 12` response as hex. It is
-  not text: an MR22 answers `02 02 28 34 23` followed by `ff` filler, and
-  the encoding of those five bytes is unknown, so they are passed through
-  untouched
-- `fw_major`: firmware version byte the TV uses to gate further commands
-- `fw_zone`: region zone byte
-- `battery_level`: 0-63, decoded from report byte 3
-- `scd`: the remote's sensor calibration blob as hex, empty until the remote
-  answers `F9 17`. The response arrives as 155-byte frames carrying a "more
-  follows" flag in byte 2 and the count of valid payload bytes in byte 3. The
-  remote reuses one transmit buffer, so the bytes past that count are the
-  previous frame and are dropped; an MR22 answers with 150 then 110 bytes.
-  The payload itself is passed through unparsed
-
-## Calibration System
-
-### Calibration File Format
-The driver loads calibration data from binary files via Linux Firmware subsystem:
-- `lg_magic_calib_XX_XX_XX_XX_XX_XX.bin` - MAC address-specific individual calibration
-- `lg_magic_calib.bin` - Fallback calibration
-
-The kernel module only accepts the versioned, little-endian fixed-point format
-written by `scripts/convert_calib.py`. All values are signed 16.16 fixed-point
-numbers stored in 32 bits; the driver never parses floating-point data.
-
-If you have a blob created by an older version of this project (8 native-endian
-IEEE-754 `float` values), convert it once:
+The attributes are per HID device. Locate them with:
 
 ```bash
-python3 scripts/convert_calib.py legacy_float.bin lg_magic_calib.bin --from-legacy
-# Add --legacy-endian big if the old blob was created on a big-endian machine.
+ls /sys/bus/hid/devices/*/airmouse
 ```
 
-The converter validates the ranges and rejects NaN/Inf values.
+| Attribute | Access | Units | Meaning |
+|---|---|---|---|
+| `airmouse` | rw | 0/1 | Enable pointer mode |
+| `airmouse_threshold` | rw | deg/s | Shake threshold |
+| `sensitivity_x` | rw | px/rad | Horizontal cursor sensitivity |
+| `sensitivity_y` | rw | px/rad | Vertical cursor sensitivity |
 
-### Creating Calibration Files
+Diagnostic attributes (`fw_version`, `fw_major`, `fw_zone`, `battery_level`,
+`scd`, `motion`) are available in the same directory.
 
-1. **Collect IMU samples:**
-```bash
-python3 scripts/capture_imu.py samples.csv
-```
+## Project structure
 
-2. **Calculate calibration values:**
-```bash
-# Calibrate accelerometer (slowly rotate across all axes while collecting)
-python3 scripts/calibrate.py --accel samples.csv calib_accel.json
+- `kernel/` — kernel module sources and DKMS configuration
+- `scripts/` — optional host-side utilities, see [docs/scripts.md](docs/scripts.md)
+- `docs/` — reference documentation
+- `voice/` — optional microphone subproject, see [voice/README.md](voice/README.md)
+- `images/` — README assets
+- `51-lgimu.rules` — udev rule for non-root IMU access
 
-# Calibrate gyroscope (keep remote stationary while collecting)
-python3 scripts/calibrate.py --gyro samples.csv calib_gyro.json
+## Documentation
 
-# Combine Gyro/Accel JSONs
-Combine gyro/accel sections. Adjust gyro scale. Out of scope of this project, recommended value about 0.07
-
-```
-
-3. **Convert to binary format:**
-```bash
-python3 scripts/convert_calib.py calib.json lg_magic_calib.bin --alpha 0.2 --mouse_k 0.5
-```
-
-Run the converter tests with:
-
-```bash
-python3 scripts/test_convert_calib.py
-```
-
-The fixed-point math can be tested on the host as well:
-
-```bash
-make -C tests check
-```
-
-### Calibration Parameters
-- `alpha`: Low-pass filter coefficient (0.0-1.0)
-- `mouse_k`: Airmouse sensitivity multiplier
-- `gyro_bias`: Gyroscope zero-offset values
-- `gyro_scale`: Gyroscope scaling factors
-
-## Python Tools Usage
-
-### lg_magic.py - Packet Analyzer
-```bash
-# Monitor HIDRAW packets
-python3 lg_magic.py
-```
-
-### capture_imu.py - Raw Capture
-```bash
-# Raw IMU samples for calibration (only python-evdev is required)
-python3 scripts/capture_imu.py samples.csv
-```
-
-### display_imu.py - IMU Visualization
-```bash
-# Raw IMU data display
-python3 scripts/display_imu.py
-
-# AHRS
-python3 scripts/display_imu.py --calib calib.json --ahrs
-
-# 3D orientation cube
-python3 scripts/display_imu.py --calib calib.json --cube
-
-# Uinput airmouse
-python3 scripts/display_imu.py --calib calib.json --mouse
-```
-
-### Airmouse debug
-The Python tools can create a virtual mouse device using uinput:
-
-```bash
-# Enable uinput module
-sudo modprobe uinput
-
-# Run airmouse with calibration
-python3 scripts/display_imu.py --calib calib.json --mouse
-```
-
-## Technical Details
-
-### HID Protocol Structure
-
-The remote uses report ID `0xFD` (30-byte total: 1 byte report ID + 29 bytes payload). The payload structure is:
-
-| Offset | Size | Description | Format |
-|--------|------|-------------|---------|
-| 0 | 1 | Report ID (0xFD) | uint8_t |
-| 1-2 | 2 | Packet counter | little-endian uint16 |
-| 3-4 | 2 | Constant value (0xFD00) | little-endian uint16 |
-| 5-6 | 2 | Gyro X | big-endian int16 |
-| 7-8 | 2 | Gyro Y | big-endian int16 |
-| 9-10 | 2 | Gyro Z | big-endian int16 |
-| 11-12 | 2 | Accel X | big-endian int16 |
-| 13-14 | 2 | Accel Y | big-endian int16 |
-| 15-16 | 2 | Accel Z | big-endian int16 |
-| 17-18 | 2 | Button code | big-endian uint16 |
-| 19 | 1 | Wheel delta | int8 |
-
-The remote declares no output report at all. It declares `0xF9` as a 30-byte
-input report and a 200-byte feature report (the vendor command channel),
-`0xFD` as a 30-byte input report (motion and buttons, 20 bytes are sent) and
-`0xFE` as a 124-byte input report (voice: report ID, a status byte, a
-big-endian 16-bit event code in the same code space as the button field, then
-120 bytes of audio as two 60-byte blocks).
-
-The vendor command channel `0xF9` carries a one-byte opcode after the report
-ID, sent as a two-byte SET_REPORT on the feature report. An output report is
-taken by the transport and then dropped by the remote, which declares none.
-The opcodes this project uses are `0x01` motion active, `0x03`/`0x04`/`0x05`
-voice start, stop and restart, `0x11` read firmware version and `0x17` read
-sensor calibration data. Motion is controlled by `0x01` motion active and
-`0x02` motion sleep. An LG TV issues them as its pointer is shown and hidden,
-driven by application and focus state, so the remote's motion engine sleeps
-while no pointer is on screen. The driver sends `0x01` once with the startup
-commands and never `0x02`. A command issued as probe
-ends is answered about half the time, so the driver repeats the startup
-commands once the remote's first report shows the link carrying traffic.
-Writing to the vendor GATT bank `d0ff` is a different matter entirely and
-must be avoided: writing `0x01` to characteristic `ffd1` reboots the remote
-into its DFU bootloader.
-
-The optional [voice/](voice/README.md) subproject handles the microphone
-stream in userspace.
-
-### IMU Data Processing
-- **Sampling rate**: ~50Hz (20ms intervals)
-- **Data format**: Big-endian signed 16-bit values
-- **Coordinate system**: Shown on image
-
-### Airmouse Algorithm
-1. Gyro data is bias-corrected and scaled
-2. Low-pass filtering reduces high-frequency noise
-3. Angular velocity is converted to pointer movement
-4. Threshold detection switches between navigation and pointer modes. Pressing navigation buttons return to button mode.
-
-## Filesystem Locations
-
-- **Module**: `/lib/modules/$(uname -r)/kernel/drivers/input/misc/lg_magic.ko`
-- **Calibration**: `/lib/firmware/lg_magic_calib.bin`
-- **DKMS source**: `/usr/src/lg-magic-1.0/`
-
-Voice support installs its own files; see [voice/README.md](voice/README.md).
+- [docs/airmouse.md](docs/airmouse.md) — SCD path, optional calibration, algorithm, tuning
+- [docs/hid-protocol.md](docs/hid-protocol.md) — raw reports, vendor commands, unsupported features
+- [docs/scripts.md](docs/scripts.md) — capture, calibration, visualization and tests
+- [voice/README.md](voice/README.md) — microphone subproject
 
 ## Compatibility
 
-- **Tested with**: LG Magic Remote MR20
-- **Kernel versions**: 4.15+ (tested on 6.11)
-- **Python**: 3.6+
-- **Dependencies**: python-evdev for raw capture; numpy, scipy, pyqtgraph for display and calibration
-
-The optional voice subproject has additional dependencies; see
-[voice/README.md](voice/README.md).
-
-## Not Implemented
-
-Documented remote behaviour this project deliberately leaves alone:
-
-- The infrared transmitter and the UEI code-set commands (`0xF9` opcodes `0x50`
-  to `0x74`), which drive an external set-top box
-- `0xF9 0x19` remote information and `0xF9 0x90` liquid detection
-- Over-the-air firmware update over the `d0ff` GATT bank, which is one blind
-  write away from stranding the remote in its bootloader
-- Parsing the SCD blob into calibration values; the blob is exposed raw because
-  its layout is not published
-- The Broadcom generation (MR14 to MR16A), which is BR/EDR, identifies as
-  `0a5c:8502` and uses the incompatible 22-byte report `0xFA`
+- **Tested with:** LG Magic Remote MR20
+- **Kernel:** 5.10+ (tested on 6.11 and 7.3)
+- **Python:** 3.9+ for the optional host-side tooling
 
 ## Contributing
 
-Please report issues and submit pull requests for:
-- Additional device support
-- Improved calibration algorithms
-- Bug fixes and performance improvements
+Bug reports, additional device support and fixes are welcome.
 
 ## License
 
-GPL v2 - Same as Linux kernel
+GPL v2 — same as the Linux kernel.
 
-Copyright © 2025 [Ilya Chelyadin]. This project is not affiliated with LG Electronics.
+Copyright © 2025 Ilya Chelyadin and contributors. This project is not affiliated with LG Electronics.
