@@ -106,6 +106,7 @@ struct lgmagic_drvdata {
 	u8 fw_major;
 	u8 fw_zone;
 	u8 battery;
+	u8 last_motion_state;
 
 	u16 last_keycode;
 	u16 last_btncode;
@@ -115,6 +116,9 @@ struct lgmagic_drvdata {
 
 #define LGMAGIC_REPORT_CMD 0xF9
 #define LGMAGIC_REPORT_VOICE 0xFE
+#define LGMAGIC_REPORT_MOTION 0xFD
+#define LGMAGIC_MOTION_STATE_MASK 0x03
+#define LGMAGIC_MOTION_STATE_VALID 0x01
 
 #define LGMAGIC_CMD_MOTION_ON 0x01
 #define LGMAGIC_CMD_MOTION_SLEEP 0x02
@@ -126,6 +130,10 @@ struct lgmagic_drvdata {
 #define LGMAGIC_RSP_SCD 0x17
 
 #define LGMAGIC_CODE_WHEEL 0x8044
+#define LGMAGIC_CODE_VOICE_START 0x800A
+#define LGMAGIC_CODE_VOICE_STOP 0x800D
+#define LGMAGIC_CODE_MOTION_START 0x803E
+#define LGMAGIC_CODE_MOTION_STOP 0x803F
 
 /*
  * Streaming shortcuts are mapped by physical button position, not by
@@ -178,6 +186,14 @@ static const struct {
 	{ 0x80B0, KEY_PLAY },
 	{ 0x80BA, KEY_PAUSE },
 };
+
+static bool lgmagic_code_is_control(u16 code)
+{
+	return code == LGMAGIC_CODE_VOICE_START ||
+	       code == LGMAGIC_CODE_VOICE_STOP ||
+	       code == LGMAGIC_CODE_MOTION_START ||
+	       code == LGMAGIC_CODE_MOTION_STOP;
+}
 
 static int lgmagic_cmd_send(struct hid_device *hdev, u8 opcode)
 {
@@ -489,29 +505,33 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 		return 0;
 	}
 
+	if (size < 1)
+		return 0;
+
 	if (!drvdata->started) {
 		drvdata->started = true;
 		schedule_work(&drvdata->startup);
 	}
 
-	if (size >= 1 && data[0] == LGMAGIC_REPORT_CMD)
+	if (data[0] == LGMAGIC_REPORT_CMD)
 	{
 		lgmagic_cmd_response(hdev, data, size);
 		return 0;
 	}
 
-	if (size >= 1 && data[0] == LGMAGIC_REPORT_VOICE)
+	if (data[0] == LGMAGIC_REPORT_VOICE)
 		return 0;
 
-	if (size != 20 || data[0] != 0xFD)
+	if (size != 20 || data[0] != LGMAGIC_REPORT_MOTION)
 	{
-		lgmagic_dev_warn(&hdev->dev, "Unknown descriptor with size %d and type %x", size, data[0]);
+		lgmagic_dev_dbg(&hdev->dev, "Ignored report with size %d and type %x", size, data[0]);
 		return 0; // Not ours
 	}
 
 	// Button is last two bytes before wheel
 	u16 btn_code = (data[17] << 8) | data[18];
 	s8 wheel = (s8)data[19];
+	u8 motion_state = data[3] & LGMAGIC_MOTION_STATE_MASK;
 
 	/* Parse counter (little-endian) */
 	counter = data[1] | (data[2] << 8);
@@ -520,6 +540,13 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 	drvdata->battery = data[3] >> 2;
 	spin_unlock_irqrestore(&drvdata->lock, flags);
 
+	if (motion_state != drvdata->last_motion_state)
+	{
+		lgmagic_dev_dbg(&hdev->dev, "Motion state %u (byte 3 %02x)",
+				motion_state, data[3]);
+		drvdata->last_motion_state = motion_state;
+	}
+
 	/* Parse 6 signed 16-bit values, big-endian */
 	for (i = 0; i < 6; i++) {
 		imu[i] = (data[5 + 2*i] << 8) | data[6 + 2*i];
@@ -527,25 +554,39 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 
 	if (btn_code != drvdata->last_btncode)
 	{
-		input_report_key(drvdata->input_hid, drvdata->last_keycode, 0);
+		if (drvdata->last_keycode)
+			input_report_key(drvdata->input_hid, drvdata->last_keycode, 0);
 		reporting = 1;
 		drvdata->last_keycode = 0;
 		drvdata->last_btncode = btn_code;
+		u16 report_keycode = 0;
 		if (btn_code != 0)
 		{
-			for (int i = 0; i < ARRAY_SIZE(lg_btn_map); i++) {
-				if (lg_btn_map[i].code == btn_code) {
-					u16 report_keycode = lg_btn_map[i].keycode;
+			if (lgmagic_code_is_control(btn_code))
+			{
+				lgmagic_dev_dbg(&hdev->dev, "Stream control code %04x",
+						btn_code);
+			}
+			else
+			{
+				for (int i = 0; i < ARRAY_SIZE(lg_btn_map); i++) {
+					if (lg_btn_map[i].code == btn_code) {
+						report_keycode = lg_btn_map[i].keycode;
 
-					if (lg_btn_map[i].code==LGMAGIC_CODE_WHEEL && drvdata->mode)
-						report_keycode = BTN_LEFT;
-					else
-						drvdata->mode = 0;
+						if (lg_btn_map[i].code==LGMAGIC_CODE_WHEEL && drvdata->mode)
+							report_keycode = BTN_LEFT;
+						else
+							drvdata->mode = 0;
 
-					input_report_key(drvdata->input_hid, report_keycode, 1);
-					drvdata->last_keycode = report_keycode;
-					break;
+						input_report_key(drvdata->input_hid, report_keycode, 1);
+						drvdata->last_keycode = report_keycode;
+						break;
+					}
 				}
+
+				if (!report_keycode)
+					lgmagic_dev_dbg(&hdev->dev, "Unmapped button code %04x",
+							btn_code);
 			}
 		}
 	}
@@ -562,7 +603,8 @@ static int lgmagic_raw_event(struct hid_device *hdev, struct hid_report *report,
 		reporting = 1;
 	}
 
-	if (drvdata->airmouse_enabled && drvdata->pointer_ready)
+	if (drvdata->airmouse_enabled && drvdata->pointer_ready &&
+	    motion_state == LGMAGIC_MOTION_STATE_VALID)
 	{
 		int bigmove = lgmagic_calc_mouse_gravity(&drvdata->airmouse,
 							 imu, &imu[3],
