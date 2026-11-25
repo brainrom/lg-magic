@@ -25,6 +25,15 @@ The driver accepts only 20-byte `0xFD` reports, including the report ID:
 The driver exposes `data[3] >> 2` as the `battery_level` attribute. Byte 4 is
 not used.
 
+On the tested MR20, the low two bits of byte 3 describe the active stream:
+state `1` (`byte 3 = 0xfd`) is the normal motion mode with valid IMU data,
+and state `2` (`byte 3 = 0xfe`) is voice mode. During voice mode the periodic
+IMU stream stops; the remaining `0xFD` frames repeat the last IMU values.
+The driver feeds the airmouse path only from state `1`; state `2` frames still
+update the battery level and carry the voice control codes. Disabling the
+airmouse in the driver does not change this state or stop the remote from
+sending IMU reports.
+
 The button field at bytes 17-18 is a big-endian key code. The driver compares
 it with the table below and reports the mapped Linux key; a code that is not
 in the table produces no key event. A change of the button code is treated as
@@ -35,8 +44,8 @@ The wheel delta at byte 19 is signed. In button mode it is reported as
 wheel click is code `0x8044`.
 
 The button field also carries stream markers such as `0x800A`/`0x800D`
-(voice start/stop) and `0x803E` (motion status). They are not keys and are not
-in the key table, so no key event is reported for them.
+(voice start/stop) and `0x803E` (motion resumes after voice). They are not
+keys and are not in the key table, so no key event is reported for them.
 
 The remote declares no output report. It declares `0xF9` as a 30-byte input
 report and a 200-byte feature report (the vendor command channel), `0xFD` as a
@@ -102,6 +111,28 @@ secondary power/standby button reports `0x8099` and is mapped to `KEY_SLEEP`.
 
 A host with an infrared receiver can distinguish the two: only POWER emits the
 LG NEC address `0x20DF`, command `0x08`.
+
+## Debugging a new remote
+
+Load the module with `debug=2` and watch the kernel log. On kernels built
+with `CONFIG_DYNAMIC_DEBUG`, enable the driver's dynamic debug messages first:
+
+```bash
+echo 'module lg_magic +p' | sudo tee /sys/kernel/debug/dynamic_debug/control
+```
+
+The driver reports:
+
+- mapped buttons through evdev, so they can be checked with `evtest`;
+- unmapped button codes as `Unmapped button code XXXX`;
+- stream markers as `Stream control code XXXX`;
+- motion/voice mode changes as `Motion state N (byte 3 XX)`;
+- unexpected report IDs as `Ignored report with size N and type XX`.
+
+The unmapped and stream-marker messages are emitted only when the button code
+changes, not on every `0xFD` frame. This allows a new remote to be brought up by
+pressing its buttons and reading the codes from `dmesg` before adding them to
+the key map.
 
 ## Vendor command channel `0xF9`
 
