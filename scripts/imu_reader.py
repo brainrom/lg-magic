@@ -2,8 +2,8 @@ import evdev
 from evdev import InputDevice, ecodes
 
 MODULO = 2 ** 16
-COUNTS_PER_0p02 = 256
-T_UNIT = 0.02
+COUNTS_PER_0p01 = 256
+T_UNIT = 0.01
 ACCEL = (ecodes.ABS_X, ecodes.ABS_Y, ecodes.ABS_Z)
 GYRO = (ecodes.ABS_RX, ecodes.ABS_RY, ecodes.ABS_RZ)
 
@@ -35,6 +35,6 @@ def read_samples(dev):
             dt = None
             if last_counter is not None:
                 delta = (counter - last_counter) % MODULO
-                dt = (delta / COUNTS_PER_0p02) * T_UNIT
+                dt = (delta / COUNTS_PER_0p01) * T_UNIT
             last_counter = counter
             yield counter, dt, tuple(accel), tuple(gyro)

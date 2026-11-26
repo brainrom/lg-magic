@@ -22,6 +22,14 @@ python3 scripts/capture_imu.py samples.csv
 `51-lgimu.rules` grants non-root access to the IMU event device. Install it
 under `/etc/udev/rules.d/` if needed.
 
+The CSV starts with `counter,dt,ax,ay,az,gx,gy,gz` (what `calibrate.py`
+expects) and adds a local `seq` and `host_time`. Type a label and press Enter
+while recording to write it to `<base>.marks.csv` at the current sample; use
+`--no-mark` for an unattended capture. Ctrl-C stops the capture.
+
+The IMU evdev values are the raw gyro and accelerometer counts, so a capture
+can be replayed through the kernel air-mouse math without the remote.
+
 ## Calibration
 
 `calibrate.py` extracts gyro bias/scale and accelerometer data from a captured
