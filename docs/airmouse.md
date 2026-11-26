@@ -13,13 +13,17 @@ diagnostic attribute. Module parameters are probe-time defaults.
 
 ## Zero-config SCD path
 
-The driver requests the SCD with `F9 17` and parses the two matrices it uses:
+The driver requests the SCD with `F9 17` and parses:
 
+- report period at float 0 (bytes 9..12), `0.01` on the MR19/MR20;
 - accelerometer matrix at floats 2..10 (bytes 17..52);
 - gyroscope matrix at floats 24..32 (bytes 105..140).
 
+The report period overrides the 10 ms default and is used for the cursor gain
+and the auto-bias timing.
+
 The request is skipped when a validated table is already cached for the
-remote's MAC address.
+remote's MAC address; the cache keeps the raw payload and re-parses it.
 
 Each matrix is a scale times an axis remap. The driver applies the matrix as it
 is; it does not require a specific rotation. Validation only checks that the
@@ -109,6 +113,7 @@ The SCD payload is 260 bytes. The float array starts at byte 9, not after the
 
 | Floats | Bytes | Use |
 |---|---|---|
+| `0` | `9..12` | report period in seconds (`0.01` on tested units) |
 | `2..10` | `17..52` | accelerometer scale/remap matrix |
 | `24..32` | `105..140` | gyroscope scale/remap matrix |
 

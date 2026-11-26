@@ -75,15 +75,15 @@ probes; use the per-device sysfs attributes for runtime tuning.
 
 ```bash
 sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 \
-    sensitivity_x=600 sensitivity_y=600 imu_evdev=1 debug=2
+    sensitivity_x=1200 sensitivity_y=1200 imu_evdev=1 debug=2
 ```
 
 | Parameter | Units | Default | Meaning |
 |---|---|---|---|
 | `airmouse` | 0/1 | 1 | Enable pointer mode at probe |
 | `airmouse_threshold` | deg/s | 300 | Shake threshold that enters pointer mode |
-| `sensitivity_x` | px/rad | 600 | Horizontal cursor sensitivity |
-| `sensitivity_y` | px/rad | 600 | Vertical cursor sensitivity |
+| `sensitivity_x` | px/rad | 1200 | Horizontal cursor sensitivity |
+| `sensitivity_y` | px/rad | 1200 | Vertical cursor sensitivity |
 | `imu_evdev` | 0/1 | 0 | Expose raw IMU data as an input device |
 | `debug` | 0-2 | 1 | Kernel module debug output level |
 

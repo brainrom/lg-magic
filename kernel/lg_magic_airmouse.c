@@ -319,7 +319,7 @@ static bool lgmagic_mat3_is_rotation(const s64 r[3][3])
 /* Accept a proper rotation times per-axis scales. */
 static int lgmagic_mat3_validate(const s64 m[3][3], s64 min_scale,
 				 s64 max_scale, s64 *average,
-				 s64 rotation[3][3])
+				 s64 rotation[3][3], s64 axis_scale[3])
 {
 	s64 r[3][3], scale;
 	int i, j;
@@ -340,6 +340,9 @@ static int lgmagic_mat3_validate(const s64 m[3][3], s64 min_scale,
 	{
 		*average = scale;
 		memcpy(rotation, r, sizeof(r));
+		if (axis_scale)
+			for (i = 0; i < 3; i++)
+				axis_scale[i] = lgmagic_mat3_norm(m, true, i);
 		return 0;
 	}
 
@@ -349,6 +352,9 @@ static int lgmagic_mat3_validate(const s64 m[3][3], s64 min_scale,
 	{
 		*average = scale;
 		memcpy(rotation, r, sizeof(r));
+		if (axis_scale)
+			for (i = 0; i < 3; i++)
+				axis_scale[i] = lgmagic_mat3_norm(m, false, i);
 		return 0;
 	}
 
@@ -379,13 +385,16 @@ int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 			       s64 gyro_matrix[3][3],
 			       s64 accel_matrix[3][3],
 			       s64 gyro_remap[3][3],
-			       s64 *accel_scale)
+			       s64 gyro_scale[3],
+			       s64 *accel_scale,
+			       s64 *sample_dt)
 {
 	static const u8 magic[5] = { 0x00, 0x04, 0x01, 0x05, 0x00 };
 	const size_t base = LGMAGIC_SCD_FLOAT_BASE;
 	s64 gm[3][3], am[3][3];
 	s64 gm_remap[3][3], am_remap[3][3];
-	s64 gavg, aavg, per_count;
+	s64 gavg, aavg, per_count, dt;
+	s64 sample;
 
 	if (size != LGMAGIC_SCD_SIZE)
 		return -EINVAL;
@@ -397,12 +406,12 @@ int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 		return -EINVAL;
 
 	/* ~0.0001 .. 0.1 rad/s per count. */
-	if (lgmagic_mat3_validate(gm, 6, 6554, &gavg, gm_remap))
+	if (lgmagic_mat3_validate(gm, 6, 6554, &gavg, gm_remap, gyro_scale))
 		return -EINVAL;
 
 	/* Full scale in m/s^2; the reference table encodes 8 g. */
 	if (lgmagic_mat3_validate(am, LGMAGIC_FP_ONE, 100 * LGMAGIC_FP_ONE,
-				  &aavg, am_remap))
+				  &aavg, am_remap, NULL))
 		return -EINVAL;
 
 	per_count = (aavg + (8 * LGMAGIC_ACCEL_COUNTS_PER_G) / 2) /
@@ -410,10 +419,17 @@ int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 	if (per_count < 100 || per_count > 65536)
 		return -EINVAL;
 
+	/* Float 0 is the report period in seconds (0.01 on the MR19/MR20). */
+	dt = LGMAGIC_DEFAULT_DT;
+	if (!lgmagic_float_to_q16(lgmagic_get_le32(scd + base), &sample) &&
+	    sample >= 65 && sample <= 6554)
+		dt = sample;
+
 	memcpy(gyro_matrix, gm, sizeof(gm));
 	memcpy(accel_matrix, am, sizeof(am));
 	memcpy(gyro_remap, gm_remap, sizeof(gm_remap));
 	*accel_scale = per_count;
+	*sample_dt = dt;
 	return 0;
 }
 
@@ -422,7 +438,7 @@ void lgmagic_airmouse_init(struct lg_magic_airmouse_state *state)
 	memset(state, 0, sizeof(*state));
 
 	/* Algorithm constants only; calibration and UX fields start at zero. */
-	state->dt = 1311;		/* 0.02 s */
+	state->dt = LGMAGIC_DEFAULT_DT;
 	state->gravity_alpha = 6554;	/* 0.1 */
 	state->pointing[1] = LGMAGIC_FP_ONE;
 	state->deadzone = 1311;		/* 0.02 rad/s */

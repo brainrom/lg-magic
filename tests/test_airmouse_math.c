@@ -206,7 +206,8 @@ static void test_auto_bias_converges(void)
 static void test_scd_matrix_validation(void)
 {
 	u8 scd[LGMAGIC_SCD_SIZE];
-	s64 gyro[3][3], accel[3][3], remap[3][3], accel_scale;
+	s64 gyro[3][3], accel[3][3], remap[3][3], gyro_scale[3];
+	s64 accel_scale, sample_dt;
 	double gm[3][3] = {
 		{ 0.001, 0.0, 0.0 },
 		{ 0.0, 0.001, 0.0 },
@@ -220,33 +221,52 @@ static void test_scd_matrix_validation(void)
 
 	memset(scd, 0, sizeof(scd));
 	memcpy(scd, "\x00\x04\x01\x05\x00", 5);
+	put_float(scd + 9, 0.01f);
 	write_scd_matrix(scd, 24, gm);
 	write_scd_matrix(scd, 2, am);
 
-	/* Identity remap and equal scales are accepted. */
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, &accel_scale) == 0);
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == 0);
+	CHECK(sample_dt == q16(0.01));
+	CHECK(llabs(gyro_scale[0] - q16(0.001)) <= 1);
+	CHECK(llabs(gyro_scale[1] - q16(0.001)) <= 1);
+	CHECK(llabs(gyro_scale[2] - q16(0.001)) <= 1);
 
-	/* Per-axis scales are accepted after normalisation. */
+	/* A missing/garbage sample period falls back to the 10 ms default. */
+	put_float(scd + 9, 0.0f);
+	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == 0);
+	CHECK(sample_dt == LGMAGIC_DEFAULT_DT);
+	put_float(scd + 9, 0.01f);
+
+	/* Per-axis scales are preserved in the raw-axis gyro scales. */
 	gm[0][0] = 0.0005;
 	gm[1][1] = 0.001;
 	gm[2][2] = 0.0015;
 	write_scd_matrix(scd, 24, gm);
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, &accel_scale) == 0);
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == 0);
 	CHECK(llabs(gyro[0][0] - q16(0.0005)) <= 1);
 	CHECK(llabs(gyro[1][1] - q16(0.001)) <= 1);
 	CHECK(llabs(gyro[2][2] - q16(0.0015)) <= 1);
-	CHECK(llabs(remap[0][0] - LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(gyro_scale[0] - q16(0.0005)) <= 1);
+	CHECK(llabs(gyro_scale[1] - q16(0.001)) <= 1);
+	CHECK(llabs(gyro_scale[2] - q16(0.0015)) <= 1);
 
 	/* Short payloads and wrong headers are rejected. */
 	CHECK(lgmagic_parse_scd_matrices(scd, LGMAGIC_SCD_SIZE - 1, gyro,
-					 accel, remap, &accel_scale) == -EINVAL);
+					 accel, remap, gyro_scale,
+					 &accel_scale, &sample_dt) == -EINVAL);
 	CHECK(lgmagic_parse_scd_matrices(scd, 140, gyro, accel, remap,
-					 &accel_scale) == -EINVAL);
+					 gyro_scale, &accel_scale,
+					 &sample_dt) == -EINVAL);
 	scd[0] = 0xff;
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, &accel_scale) == -EINVAL);
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == -EINVAL);
 	scd[0] = 0x00;
 
 	/* A reflection is an inversion, not a remap. */
@@ -255,7 +275,8 @@ static void test_scd_matrix_validation(void)
 	gm[2][2] = 0.001;
 	write_scd_matrix(scd, 24, gm);
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, &accel_scale) == -EINVAL);
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == -EINVAL);
 
 	/* A singular matrix is rejected. */
 	gm[0][0] = 0.0;
@@ -263,13 +284,15 @@ static void test_scd_matrix_validation(void)
 	gm[2][2] = 0.0;
 	write_scd_matrix(scd, 24, gm);
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, &accel_scale) == -EINVAL);
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == -EINVAL);
 }
 
 static void test_scd_independent_remaps(void)
 {
 	u8 scd[LGMAGIC_SCD_SIZE];
-	s64 gyro[3][3], accel[3][3], remap[3][3], accel_scale;
+	s64 gyro[3][3], accel[3][3], remap[3][3], gyro_scale[3];
+	s64 accel_scale, sample_dt;
 	double gm[3][3] = {
 		{ 0.0, -0.001, 0.0 },
 		{ 0.001, 0.0, 0.0 },
@@ -283,20 +306,21 @@ static void test_scd_independent_remaps(void)
 
 	memset(scd, 0, sizeof(scd));
 	memcpy(scd, "\x00\x04\x01\x05\x00", 5);
+	put_float(scd + 9, 0.01f);
 	write_scd_matrix(scd, 24, gm);
 	write_scd_matrix(scd, 2, am);
 
-	/*
-	 * Separate chips may have different sensor frames.  Each matrix maps
-	 * its own frame into the device frame, so the rotations need not match.
-	 */
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, &accel_scale) == 0);
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == 0);
+
+	/* The remap rotates the axes, but the raw-axis scales are unchanged. */
 	CHECK(llabs(remap[0][1] + LGMAGIC_FP_ONE) < 8);
 	CHECK(llabs(remap[1][0] - LGMAGIC_FP_ONE) < 8);
 	CHECK(llabs(remap[2][2] - LGMAGIC_FP_ONE) < 8);
-	CHECK(llabs(accel[0][0] - q16(78.4)) <= 2);
-	CHECK(llabs(accel[0][1]) < 8);
+	CHECK(llabs(gyro_scale[0] - q16(0.001)) <= 1);
+	CHECK(llabs(gyro_scale[1] - q16(0.001)) <= 1);
+	CHECK(llabs(gyro_scale[2] - q16(0.001)) <= 1);
 }
 
 static void test_scd_real_payload(void)
@@ -325,18 +349,26 @@ static void test_scd_real_payload(void)
 		0x40, 0x5d, 0xc4, 0x27, 0x40, 0x00, 0x48, 0x46, 0xc1, 0x64, 0x43, 0xc4,
 		0x3d, 0xa9, 0x58, 0xd1, 0x39, 0xe4, 0xba, 0xac,
 	};
-	s64 gyro[3][3], accel[3][3], remap[3][3], accel_scale;
+	s64 gyro[3][3], accel[3][3], remap[3][3], gyro_scale[3];
+	s64 accel_scale, sample_dt;
 	const double gs = 0.0010652969358488917;
 	const double as = 78.4000015258789;
+	int i;
 
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, &accel_scale) == 0);
+					 remap, gyro_scale, &accel_scale,
+					 &sample_dt) == 0);
+	CHECK(sample_dt == q16(0.01));
 	CHECK(llabs(gyro[0][1] + q16(gs)) <= 1);
 	CHECK(llabs(gyro[1][0] - q16(gs)) <= 1);
 	CHECK(llabs(gyro[2][2] - q16(gs)) <= 1);
 	CHECK(llabs(accel[0][1] + q16(as)) <= 2);
 	CHECK(llabs(accel[1][0] - q16(as)) <= 2);
 	CHECK(llabs(accel[2][2] - q16(as)) <= 2);
+
+	/* The column norms are the per-raw-axis gyro scales. */
+	for (i = 0; i < 3; i++)
+		CHECK(llabs(gyro_scale[i] - q16(gs)) <= 1);
 }
 
 static struct lgmagic_calib_blob make_blob(void)

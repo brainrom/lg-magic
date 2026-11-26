@@ -75,15 +75,15 @@ sudo dkms install -m lg-magic -v 1.0
 
 ```bash
 sudo modprobe lg_magic airmouse=1 airmouse_threshold=300 \
-    sensitivity_x=600 sensitivity_y=600 imu_evdev=1 debug=2
+    sensitivity_x=1200 sensitivity_y=1200 imu_evdev=1 debug=2
 ```
 
 | Параметр | Единицы | По умолчанию | Значение |
 |---|---|---|---|
 | `airmouse` | 0/1 | 1 | Включить режим указателя при подключении устройства |
 | `airmouse_threshold` | °/s | 300 | Порог встряхивания |
-| `sensitivity_x` | px/rad | 600 | Горизонтальная чувствительность |
-| `sensitivity_y` | px/rad | 600 | Вертикальная чувствительность |
+| `sensitivity_x` | px/rad | 1200 | Горизонтальная чувствительность |
+| `sensitivity_y` | px/rad | 1200 | Вертикальная чувствительность |
 | `imu_evdev` | 0/1 | 0 | Отдавать сырые данные IMU как отдельное устройство ввода |
 | `debug` | 0-2 | 1 | Уровень отладочной информации модуля ядра |
 

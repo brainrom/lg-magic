@@ -9,6 +9,9 @@
 /* Fixed size of the F9 17 sensor calibration table. */
 #define LGMAGIC_SCD_SIZE	260
 
+/* Sample period used when the SCD does not provide one: 10 ms. */
+#define LGMAGIC_DEFAULT_DT	656
+
 /* On-disk calibration blob, little-endian Q16.16.  Keep in sync with
  * scripts/convert_calib.py.
  */
@@ -38,14 +41,16 @@ s64 lgmagic_degps_to_radps(s64 degps);
 s64 lgmagic_radps_to_degps(s64 radps);
 
 /*
- * Parse the SCD matrices (rad/s and m/s^2 per count) and the gyro remap
- * used for the pointing axis; the two rotations may differ.
+ * Parse the SCD matrices (rad/s and m/s^2 per count), the per-raw-axis
+ * gyro scales, the gyro remap and the sample period from float 0.
  */
 int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 			       s64 gyro_matrix[3][3],
 			       s64 accel_matrix[3][3],
 			       s64 gyro_remap[3][3],
-			       s64 *accel_scale);
+			       s64 gyro_scale[3],
+			       s64 *accel_scale,
+			       s64 *sample_dt);
 
 /*
  * Gravity-projected pointer state, all Q16.16.  The cursor uses yaw =
@@ -57,6 +62,7 @@ struct lg_magic_airmouse_state
 	s64 gyro_bias[3];	/* counts */
 	s64 gyro_matrix[3][3];	/* rad/s per count, includes remap */
 	s64 accel_matrix[3][3];	/* m/s^2 per count, includes remap */
+	s64 gyro_scale[3];	/* per-raw-axis scale, rad/s per count */
 	s64 accel_scale;	/* unused summary, m/s^2 per count */
 	s64 sensitivity_x;	/* pixels per radian */
 	s64 sensitivity_y;	/* pixels per radian */
