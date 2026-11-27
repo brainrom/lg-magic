@@ -321,13 +321,17 @@ static void lgmagic_apply_scd(struct lgmagic_drvdata *drvdata,
 			      const s64 accel_matrix[3][3],
 			      const s64 gyro_remap[3][3],
 			      const s64 gyro_scale[3],
-			      s64 accel_scale, s64 sample_dt)
+			      const s64 accel_scale[3], s64 sample_dt)
 {
 	int i;
 
 	/* The sample period describes the stream, not the sensor frame. */
 	if (sample_dt > 0)
 		drvdata->airmouse.dt = sample_dt;
+
+	/* The accelerometer scale describes the sensor, not the gyro blob. */
+	for (i = 0; i < 3; i++)
+		drvdata->airmouse.accel_scale[i] = accel_scale[i];
 
 	if (drvdata->blob_valid)
 		return;
@@ -338,7 +342,6 @@ static void lgmagic_apply_scd(struct lgmagic_drvdata *drvdata,
 	       sizeof(drvdata->airmouse.accel_matrix));
 	for (i = 0; i < 3; i++)
 		drvdata->airmouse.gyro_scale[i] = gyro_scale[i];
-	drvdata->airmouse.accel_scale = accel_scale;
 	lgmagic_airmouse_set_remap(&drvdata->airmouse, gyro_remap);
 	drvdata->airmouse.gravity_valid = 0;
 	drvdata->airmouse.gyro_matrix_valid = 1;
@@ -376,8 +379,7 @@ static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
 	struct lgmagic_drvdata *drvdata = hid_get_drvdata(hdev);
 	unsigned long flags;
 	s64 gyro_matrix[3][3], accel_matrix[3][3], gyro_remap[3][3];
-	s64 gyro_scale[3];
-	s64 accel_scale = 0;
+	s64 gyro_scale[3], accel_scale[3];
 	s64 sample_dt = LGMAGIC_DEFAULT_DT;
 	u8 raw[LGMAGIC_SCD_SIZE];
 	size_t len, total;
@@ -413,7 +415,7 @@ static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
 						    accel_matrix,
 						    gyro_remap,
 						    gyro_scale,
-						    &accel_scale,
+						    accel_scale,
 						    &sample_dt) == 0;
 		if (parsed)
 			memcpy(raw, drvdata->scd, sizeof(raw));
@@ -435,8 +437,10 @@ static void lgmagic_scd_chunk(struct hid_device *hdev, u8 *data, int size)
 				  gyro_remap, gyro_scale, accel_scale,
 				  sample_dt);
 		lgmagic_dev_info(&hdev->dev,
-				 "SCD accepted, gyro scale %lld/%lld/%lld, dt %lld (Q16.16)",
+				 "SCD accepted, gyro scale %lld/%lld/%lld, "
+				 "accel counts/g %lld/%lld/%lld, dt %lld (Q16.16)",
 				 gyro_scale[0], gyro_scale[1], gyro_scale[2],
+				 accel_scale[0], accel_scale[1], accel_scale[2],
 				 sample_dt);
 		return;
 	}
@@ -926,7 +930,8 @@ static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagi
 	drvdata->airmouse.pointing[1] = LGMAGIC_FP_ONE;
 	drvdata->airmouse.pointing[2] = 0;
 	drvdata->airmouse.accel_matrix_valid = 0;
-	drvdata->airmouse.accel_scale = 0;
+	memset(drvdata->airmouse.accel_scale, 0,
+	       sizeof(drvdata->airmouse.accel_scale));
 	drvdata->airmouse.gravity_valid = 0;
 	drvdata->airmouse.gyro_matrix_valid = 1;
 	drvdata->airmouse.gyro_valid = 1;
@@ -990,19 +995,19 @@ loaded:
 
 	{
 		s64 cached_gyro[3][3], cached_accel[3][3], cached_remap[3][3];
-		s64 cached_scale[3], cached_average, cached_dt;
+		s64 cached_gyro_scale[3], cached_accel_scale[3], cached_dt;
 		u8 cached_raw[LGMAGIC_SCD_SIZE];
 
 		/* A cache hit means no new F9 17 request. */
 		if (lgmagic_scd_cache_lookup(hdev->uniq, cached_raw) &&
 		    !lgmagic_parse_scd_matrices(cached_raw, sizeof(cached_raw),
 						cached_gyro, cached_accel,
-						cached_remap, cached_scale,
-						&cached_average, &cached_dt))
+						cached_remap, cached_gyro_scale,
+						cached_accel_scale, &cached_dt))
 		{
 			lgmagic_apply_scd(drvdata, cached_gyro, cached_accel,
-					  cached_remap, cached_scale,
-					  cached_average, cached_dt);
+					  cached_remap, cached_gyro_scale,
+					  cached_accel_scale, cached_dt);
 			spin_lock_irqsave(&drvdata->lock, flags);
 			memcpy(drvdata->scd, cached_raw, sizeof(cached_raw));
 			drvdata->scd_len = sizeof(cached_raw);

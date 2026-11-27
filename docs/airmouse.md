@@ -16,17 +16,22 @@ The driver requests the SCD with `F9 17` and uses:
 
 - report period at float 0 (`0.01` on tested units);
 - accelerometer matrix at floats 2..10;
+- accelerometer reference block at floats 20..22 and per-axis coefficients at
+  floats 54/56/57;
 - gyroscope matrix at floats 24..32.
 
 The report period drives the cursor gain, gravity propagation and auto-bias.
-The gyro matrix maps raw counts to angular velocity in the device frame; the
-accelerometer matrix maps raw counts to the up direction. The gyro matrix is
-also decomposed into a rotation (the remap) and per-axis scales; the remap
-rotates the pointing axis.
+The matrices provide the device-frame rotation; the gyro columns also give the
+per-axis gyro scales. The accelerometer tail gives the scale:
 
-Each matrix must decompose into a proper rotation and per-axis scales; invalid
-payloads are rejected. A validated table is cached by MAC and re-parsed on
-reconnect.
+```
+counts/g = g * reference / coefficient
+```
+
+If the tail is missing or implausible, the scale is unknown and the magnitude
+gate is skipped. Matrices must decompose into a proper rotation and per-axis
+scales; invalid payloads are rejected. A validated table is cached by MAC and
+re-parsed on reconnect.
 
 The SCD has no per-unit gyro bias; the driver learns it while the remote is
 still. A valid calibration blob disables auto-bias and keeps its measured bias.
@@ -58,13 +63,14 @@ A valid blob overrides the SCD gyro scale/bias for that unit.
 All report-path calculations use Q16.16 fixed point.
 
 - Correct the gyro by bias and map it to the device frame.
-- Apply the accelerometer matrix and normalize; the sensor reports specific
-  force, so this is the up vector.
+- Scale the accelerometer by its per-axis counts/g (when known), apply the
+  accelerometer matrix and normalize; the sensor reports specific force, so
+  this is the up vector.
 - Track gravity with the gyro and correct it with the accelerometer. Ignore a
-  sample when its magnitude is far from 1g. While still, replace the estimate
-  with the accelerometer; otherwise correct toward it. A new estimate learns
-  fast until a still sample confirms it, then tracks slowly, so a bad startup
-  sample is repaired without putting the remote down.
+  sample when its scaled magnitude is far from 1g. While still, replace the
+  estimate with the accelerometer; otherwise correct toward it. A new estimate
+  learns fast until a still sample confirms it, then tracks slowly, so a bad
+  startup sample is repaired without putting the remote down.
 - Build the cursor basis from the current up vector and the fixed pointing
   axis `p`. Motion is `omega x p` projected on that basis, so a roll around
   `p` cancels. No stored screen-forward or initial yaw is used.
@@ -83,9 +89,13 @@ The SCD payload is 260 bytes. The float array starts at byte 9; float k is at
 |---|---|---|
 | 0 | 9..12 | report period |
 | 2..10 | 17..52 | accelerometer matrix |
+| 20..22 | 89..100 | accelerometer reference block |
 | 24..32 | 105..140 | gyroscope matrix |
+| 54 | 225..228 | z acceleration per reference block |
+| 56..57 | 233..240 | x/y acceleration per reference block |
 
-The remaining SCD fields are not used by the driver.
+The tail mapping was identified from 1g and 8g captures; the remaining tail
+fields are unused.
 
 ## Troubleshooting
 
@@ -103,7 +113,8 @@ accelerometer; otherwise the sensor frame or pointing axis is wrong.
 
 ## Testing
 
-`make -C tests check` covers SCD parsing, matrix/blob validation, the
-projection and its roll/tilt invariants, gravity seeding and recovery, the
-pre-gravity fallback, and auto-bias. The conversion tooling is tested in
+`make -C tests check` covers SCD parsing (including the per-axis
+accelerometer scale), matrix/blob validation, the projection and its
+roll/tilt invariants, gravity seeding and recovery, the pre-gravity fallback,
+and auto-bias. The conversion tooling is tested in
 [scripts.md](scripts.md#tests).

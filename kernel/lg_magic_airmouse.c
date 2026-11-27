@@ -230,11 +230,22 @@ static s16 lgmagic_clamp_s16(s64 v)
 /* Largest accepted SCD matrix element; keeps the norm computations in u64. */
 #define LGMAGIC_MATRIX_ELEMENT_MAX	(1LL << 30)
 #define LGMAGIC_MATRIX_TOL		(LGMAGIC_FP_ONE / 16)
-#define LGMAGIC_ACCEL_COUNTS_PER_G	41
+#define LGMAGIC_EARTH_G_Q16		642689	/* 9.80665 m/s^2 */
 
 #define LGMAGIC_SCD_FLOAT_BASE		9
 #define LGMAGIC_SCD_ACCEL_FLOAT		2
 #define LGMAGIC_SCD_GYRO_FLOAT		24
+
+/*
+ * The SCD tail carries the accelerometer reference block and the
+ * acceleration per block for each axis.  The mapping below was identified
+ * from 1 g and 8 g captures: the two equal axes use 2.62136 m/s^2 per
+ * 9.0112 counts, the remaining axis uses 2.01734.
+ */
+#define LGMAGIC_SCD_ACCEL_REF_FLOAT	20
+#define LGMAGIC_SCD_ACCEL_COEFF_Z_FLOAT	54
+#define LGMAGIC_SCD_ACCEL_COEFF_X_FLOAT	56
+#define LGMAGIC_SCD_ACCEL_COEFF_Y_FLOAT	57
 
 static s64 lgmagic_mat3_norm(const s64 m[3][3], bool column, int idx)
 {
@@ -381,20 +392,29 @@ static int lgmagic_scd_read_matrix(const u8 *scd, size_t base,
 	return 0;
 }
 
+static int lgmagic_scd_read_float(const u8 *scd, size_t base,
+				  size_t index, s64 *out)
+{
+	return lgmagic_float_to_q16(lgmagic_get_le32(scd + base + 4 * index),
+				    out);
+}
+
 int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 			       s64 gyro_matrix[3][3],
 			       s64 accel_matrix[3][3],
 			       s64 gyro_remap[3][3],
 			       s64 gyro_scale[3],
-			       s64 *accel_scale,
+			       s64 accel_counts_per_g[3],
 			       s64 *sample_dt)
 {
 	static const u8 magic[5] = { 0x00, 0x04, 0x01, 0x05, 0x00 };
 	const size_t base = LGMAGIC_SCD_FLOAT_BASE;
 	s64 gm[3][3], am[3][3];
 	s64 gm_remap[3][3], am_remap[3][3];
-	s64 gavg, aavg, per_count, dt;
-	s64 sample;
+	s64 gavg, aavg, dt;
+	s64 sample, ref[3], coeff[3];
+	bool scale_ok = true;
+	int i;
 
 	if (size != LGMAGIC_SCD_SIZE)
 		return -EINVAL;
@@ -414,10 +434,51 @@ int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 				  &aavg, am_remap, NULL))
 		return -EINVAL;
 
-	per_count = (aavg + (8 * LGMAGIC_ACCEL_COUNTS_PER_G) / 2) /
-		    (8 * LGMAGIC_ACCEL_COUNTS_PER_G);
-	if (per_count < 100 || per_count > 65536)
-		return -EINVAL;
+	/*
+	 * counts/g = g * reference / coefficient.  A missing or implausible
+	 * tail leaves the scale unknown; the pointer then runs without a
+	 * magnitude gate instead of using a hard-coded count constant.
+	 */
+	for (i = 0; i < 3; i++)
+	{
+		if (lgmagic_scd_read_float(scd, base,
+					   LGMAGIC_SCD_ACCEL_REF_FLOAT + i,
+					   &ref[i]) || ref[i] <= 0)
+			scale_ok = false;
+	}
+
+	coeff[0] = 0;
+	coeff[1] = 0;
+	coeff[2] = 0;
+	if (lgmagic_scd_read_float(scd, base,
+				   LGMAGIC_SCD_ACCEL_COEFF_X_FLOAT, &coeff[0]) ||
+	    lgmagic_scd_read_float(scd, base,
+				   LGMAGIC_SCD_ACCEL_COEFF_Y_FLOAT, &coeff[1]) ||
+	    lgmagic_scd_read_float(scd, base,
+				   LGMAGIC_SCD_ACCEL_COEFF_Z_FLOAT, &coeff[2]))
+		scale_ok = false;
+
+	for (i = 0; i < 3; i++)
+	{
+		if (coeff[i] <= 0)
+			scale_ok = false;
+	}
+
+	if (scale_ok)
+	{
+		for (i = 0; i < 3; i++)
+		{
+			s64 cpg = (LGMAGIC_EARTH_G_Q16 * ref[i]) / coeff[i];
+
+			if (cpg < LGMAGIC_FP_ONE ||
+			    cpg > 10000 * LGMAGIC_FP_ONE)
+				scale_ok = false;
+			accel_counts_per_g[i] = cpg;
+		}
+	}
+
+	if (!scale_ok)
+		memset(accel_counts_per_g, 0, 3 * sizeof(s64));
 
 	/* Float 0 is the report period in seconds (0.01 on the MR19/MR20). */
 	dt = LGMAGIC_DEFAULT_DT;
@@ -428,7 +489,6 @@ int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 	memcpy(gyro_matrix, gm, sizeof(gm));
 	memcpy(accel_matrix, am, sizeof(am));
 	memcpy(gyro_remap, gm_remap, sizeof(gm_remap));
-	*accel_scale = per_count;
 	*sample_dt = dt;
 	return 0;
 }
@@ -479,25 +539,15 @@ static void lgmagic_rotate_back(s64 v[3], const s64 omega[3], s64 dt)
  * period.  The first still sample confirms the estimate and switches to the
  * slower, steadier gain, where hand acceleration no longer tilts the basis.
  *
- * The accelerometer is ignored while its magnitude is far from 1 g.
+ * The accelerometer is ignored while its scaled magnitude is far from 1 g.
  */
 static int lgmagic_update_gravity(struct lg_magic_airmouse_state *state,
-				  const s16 *accel, const s64 *omega,
+				  bool a_ok, const s64 *omega,
 				  const s64 *unit)
 {
-	s64 g[3], gain, dev, speed2;
-	u64 n2, n;
-	bool a_ok, still;
+	s64 g[3], gain, speed2;
+	bool still;
 	int i;
-
-	n2 = (u64)((s64)accel[0] * accel[0]) +
-	     (u64)((s64)accel[1] * accel[1]) +
-	     (u64)((s64)accel[2] * accel[2]);
-	n = lgmagic_isqrt64(n2);
-	dev = (s64)n - LGMAGIC_ACCEL_COUNTS_PER_G;
-	if (dev < 0)
-		dev = -dev;
-	a_ok = dev <= state->accel_gate;
 
 	speed2 = lgmagic_fpdot(omega, omega);
 	still = speed2 < lgmagic_fpmul(state->zero_rate, state->zero_rate);
@@ -559,7 +609,7 @@ void lgmagic_airmouse_init(struct lg_magic_airmouse_state *state)
 	state->dt = LGMAGIC_DEFAULT_DT;
 	state->gravity_gain = LGMAGIC_FP_ONE;
 	state->gravity_gain_fast = 10 * LGMAGIC_FP_ONE;
-	state->accel_gate = 4;		/* ~0.1 g, in accelerometer counts */
+	state->accel_gate = (3 * LGMAGIC_FP_ONE) / 20;	/* 0.15 g */
 	state->pointing[1] = LGMAGIC_FP_ONE;
 	/* Identity remap until the SCD supplies one (blob/raw devices). */
 	state->fallback_right[2] = LGMAGIC_FP_ONE;
@@ -638,9 +688,11 @@ int lgmagic_calc_mouse_gravity(struct lg_magic_airmouse_state *state,
 			       const s16 *gyro, const s16 *accel,
 			       s16 *mouse)
 {
-	s64 corr[3], omega[3], unit[3];
+	s64 corr[3], omega[3], unit[3], corrected[3];
 	s64 right[3], vertical[3], motion[3];
-	s64 dx = 0, dy = 0, dxr, dyr, speed2, limit2;
+	s64 dx = 0, dy = 0, dxr, dyr, dev, speed2, limit2;
+	u64 n2, n;
+	bool a_ok, scale_known;
 	int i;
 
 	mouse[0] = 0;
@@ -670,22 +722,27 @@ int lgmagic_calc_mouse_gravity(struct lg_magic_airmouse_state *state,
 		}
 	}
 
+	scale_known = state->accel_scale[0] && state->accel_scale[1] &&
+		      state->accel_scale[2];
+
+	for (i = 0; i < 3; i++)
+	{
+		corrected[i] = (s64)accel[i] * LGMAGIC_FP_ONE;
+		if (scale_known)
+			corrected[i] = corrected[i] * LGMAGIC_FP_ONE /
+				       state->accel_scale[i];
+	}
+
 	if (state->accel_matrix_valid)
 	{
-		s64 raw[3];
-
-		for (i = 0; i < 3; i++)
-			raw[i] = (s64)accel[i] * LGMAGIC_FP_ONE;
-
-		lgmagic_mat3_vec(state->accel_matrix, raw, unit);
+		lgmagic_mat3_vec(state->accel_matrix, corrected, unit);
 		if (lgmagic_vec_normalize(unit))
 			return 0;
 	}
-	else if (state->accel_scale)
+	else if (scale_known)
 	{
-		/* accel_scale is parsed but intentionally unused. */
 		for (i = 0; i < 3; i++)
-			unit[i] = (s64)accel[i] * state->accel_scale;
+			unit[i] = corrected[i];
 
 		if (lgmagic_vec_normalize(unit))
 			return 0;
@@ -695,7 +752,24 @@ int lgmagic_calc_mouse_gravity(struct lg_magic_airmouse_state *state,
 		return 0;
 	}
 
-	if (lgmagic_update_gravity(state, accel, omega, unit))
+	if (scale_known)
+	{
+		n2 = 0;
+		for (i = 0; i < 3; i++)
+			n2 += (u64)(corrected[i] * corrected[i]);
+		n = lgmagic_isqrt64(n2);
+		dev = (s64)n - LGMAGIC_FP_ONE;
+		if (dev < 0)
+			dev = -dev;
+		a_ok = dev <= state->accel_gate;
+	}
+	else
+	{
+		/* No SCD scale: accept the sample rather than use a constant. */
+		a_ok = true;
+	}
+
+	if (lgmagic_update_gravity(state, a_ok, omega, unit))
 	{
 		/*
 		 * Gravity is not usable yet.  Move approximately on the raw

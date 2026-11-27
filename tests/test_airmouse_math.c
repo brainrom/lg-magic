@@ -171,7 +171,11 @@ static struct lg_magic_airmouse_state make_gravity_state(void)
 	state.gravity_gain_fast = 0;
 	state.deadzone = 0;
 	state.threshold = 100 * LGMAGIC_FP_ONE;
-	state.accel_gate = 4;
+	/* Per-axis test scale: 41 counts/g is convenient for the raw vectors. */
+	state.accel_scale[0] = q16(41.0);
+	state.accel_scale[1] = q16(41.0);
+	state.accel_scale[2] = q16(41.0);
+	state.accel_gate = q16(0.15);
 
 	return state;
 }
@@ -290,6 +294,58 @@ static void test_gravity_seed_and_recovery(void)
  * enough to repair it; after confirmation it must track slowly so that hand
  * acceleration does not tilt the basis.
  */
+
+/* Without an SCD scale the magnitude gate is skipped, not hard-coded. */
+
+/*
+ * The SCD-derived scales must accept real 1 g orientations.  The vectors
+ * are the measured means from the six static positions; the worst one is the
+ * low y side, which is why the gate is 0.15 g rather than 0.1 g.
+ */
+static void test_scd_accel_scale_accepts_1g_orientations(void)
+{
+	static const s16 vectors[][3] = {
+		{ 1, 0, -42 },		/* z+ */
+		{ 0, 5, 44 },		/* z- */
+		{ -31, 4, -3 },		/* x+ */
+		{ 35, 3, 3 },		/* x- */
+		{ 1, 35, -5 },		/* y+ */
+		{ -1, -29, -3 },	/* y- */
+	};
+	s16 zero[3] = { 0, 0, 0 };
+	s16 mouse[2];
+	unsigned int i;
+
+	for (i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++)
+	{
+		struct lg_magic_airmouse_state state = make_gravity_state();
+
+		state.accel_scale[0] = q16(33.711);
+		state.accel_scale[1] = q16(33.711);
+		state.accel_scale[2] = q16(43.805);
+		state.gravity_valid = 0;
+
+		lgmagic_calc_mouse_gravity(&state, zero, vectors[i], mouse);
+		CHECK(state.gravity_valid == 1);
+	}
+}
+
+static void test_gravity_without_scale_skips_gate(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s16 zero[3] = { 0, 0, 0 };
+	s16 high[3] = { 41, 0, -41 };	/* 1.4 g, but no scale is known */
+	s16 mouse[2];
+
+	state.gravity_valid = 0;
+	state.accel_scale[0] = 0;
+	state.accel_scale[1] = 0;
+	state.accel_scale[2] = 0;
+
+	lgmagic_calc_mouse_gravity(&state, zero, high, mouse);
+	CHECK(state.gravity_valid == 1);
+}
+
 static void test_gravity_fast_learning_until_settled(void)
 {
 	struct lg_magic_airmouse_state state = make_gravity_state();
@@ -548,7 +604,7 @@ static void test_scd_matrix_validation(void)
 {
 	u8 scd[LGMAGIC_SCD_SIZE];
 	s64 gyro[3][3], accel[3][3], remap[3][3], gyro_scale[3];
-	s64 accel_scale, sample_dt;
+	s64 accel_scale[3], sample_dt;
 	double gm[3][3] = {
 		{ 0.001, 0.0, 0.0 },
 		{ 0.0, 0.001, 0.0 },
@@ -567,17 +623,22 @@ static void test_scd_matrix_validation(void)
 	write_scd_matrix(scd, 2, am);
 
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == 0);
 	CHECK(sample_dt == q16(0.01));
 	CHECK(llabs(gyro_scale[0] - q16(0.001)) <= 1);
 	CHECK(llabs(gyro_scale[1] - q16(0.001)) <= 1);
 	CHECK(llabs(gyro_scale[2] - q16(0.001)) <= 1);
 
+	/* A zero tail leaves the accelerometer scale unknown. */
+	CHECK(accel_scale[0] == 0);
+	CHECK(accel_scale[1] == 0);
+	CHECK(accel_scale[2] == 0);
+
 	/* A missing/garbage sample period falls back to the 10 ms default. */
 	put_float(scd + 9, 0.0f);
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == 0);
 	CHECK(sample_dt == LGMAGIC_DEFAULT_DT);
 	put_float(scd + 9, 0.01f);
@@ -588,7 +649,7 @@ static void test_scd_matrix_validation(void)
 	gm[2][2] = 0.0015;
 	write_scd_matrix(scd, 24, gm);
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == 0);
 	CHECK(llabs(gyro[0][0] - q16(0.0005)) <= 1);
 	CHECK(llabs(gyro[1][1] - q16(0.001)) <= 1);
@@ -600,13 +661,13 @@ static void test_scd_matrix_validation(void)
 	/* Short payloads and wrong headers are rejected. */
 	CHECK(lgmagic_parse_scd_matrices(scd, LGMAGIC_SCD_SIZE - 1, gyro,
 					 accel, remap, gyro_scale,
-					 &accel_scale, &sample_dt) == -EINVAL);
+					 accel_scale, &sample_dt) == -EINVAL);
 	CHECK(lgmagic_parse_scd_matrices(scd, 140, gyro, accel, remap,
-					 gyro_scale, &accel_scale,
+					 gyro_scale, accel_scale,
 					 &sample_dt) == -EINVAL);
 	scd[0] = 0xff;
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == -EINVAL);
 	scd[0] = 0x00;
 
@@ -616,7 +677,7 @@ static void test_scd_matrix_validation(void)
 	gm[2][2] = 0.001;
 	write_scd_matrix(scd, 24, gm);
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == -EINVAL);
 
 	/* A singular matrix is rejected. */
@@ -625,7 +686,7 @@ static void test_scd_matrix_validation(void)
 	gm[2][2] = 0.0;
 	write_scd_matrix(scd, 24, gm);
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == -EINVAL);
 }
 
@@ -633,7 +694,7 @@ static void test_scd_independent_remaps(void)
 {
 	u8 scd[LGMAGIC_SCD_SIZE];
 	s64 gyro[3][3], accel[3][3], remap[3][3], gyro_scale[3];
-	s64 accel_scale, sample_dt;
+	s64 accel_scale[3], sample_dt;
 	double gm[3][3] = {
 		{ 0.0, -0.001, 0.0 },
 		{ 0.001, 0.0, 0.0 },
@@ -652,7 +713,7 @@ static void test_scd_independent_remaps(void)
 	write_scd_matrix(scd, 2, am);
 
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == 0);
 
 	/* The remap rotates the axes, but the raw-axis scales are unchanged. */
@@ -691,13 +752,13 @@ static void test_scd_real_payload(void)
 		0x3d, 0xa9, 0x58, 0xd1, 0x39, 0xe4, 0xba, 0xac,
 	};
 	s64 gyro[3][3], accel[3][3], remap[3][3], gyro_scale[3];
-	s64 accel_scale, sample_dt;
+	s64 accel_scale[3], sample_dt;
 	const double gs = 0.0010652969358488917;
 	const double as = 78.4000015258789;
 	int i;
 
 	CHECK(lgmagic_parse_scd_matrices(scd, sizeof(scd), gyro, accel,
-					 remap, gyro_scale, &accel_scale,
+					 remap, gyro_scale, accel_scale,
 					 &sample_dt) == 0);
 	CHECK(sample_dt == q16(0.01));
 	CHECK(llabs(gyro[0][1] + q16(gs)) <= 1);
@@ -710,6 +771,14 @@ static void test_scd_real_payload(void)
 	/* The column norms are the per-raw-axis gyro scales. */
 	for (i = 0; i < 3; i++)
 		CHECK(llabs(gyro_scale[i] - q16(gs)) <= 1);
+
+	/*
+	 * The SCD tail gives counts/g = g * reference / coefficient:
+	 * 9.80665 * 9.0112 / 2.62136 for x/y and / 2.01734 for z.
+	 */
+	CHECK(llabs(accel_scale[0] - q16(33.711)) <= q16(0.2));
+	CHECK(llabs(accel_scale[1] - q16(33.711)) <= q16(0.2));
+	CHECK(llabs(accel_scale[2] - q16(43.805)) <= q16(0.2));
 }
 
 static struct lgmagic_calib_blob make_blob(void)
@@ -773,6 +842,8 @@ int main(void)
 	test_baseline_axes_and_signs();
 	test_gravity_projection_matches_baseline();
 	test_gravity_seed_and_recovery();
+	test_scd_accel_scale_accepts_1g_orientations();
+	test_gravity_without_scale_skips_gate();
 	test_gravity_fast_learning_until_settled();
 	test_gravity_fallback_before_seed();
 	test_fallback_basis_uses_remap();

@@ -42,15 +42,16 @@ s64 lgmagic_radps_to_degps(s64 radps);
 
 /*
  * Parse the SCD matrices (rad/s and m/s^2 per count), the per-raw-axis
- * gyro scales (used by the fixed-axis reference), the gyro remap and the
- * sample period from float 0.
+ * gyro scales (used by the fixed-axis reference), the gyro remap, the
+ * per-axis accelerometer scale in counts per g and the sample period.
+ * The accelerometer scale is zero when the SCD tail is not recognized.
  */
 int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 			       s64 gyro_matrix[3][3],
 			       s64 accel_matrix[3][3],
 			       s64 gyro_remap[3][3],
 			       s64 gyro_scale[3],
-			       s64 *accel_scale,
+			       s64 accel_counts_per_g[3],
 			       s64 *sample_dt);
 
 /*
@@ -68,14 +69,14 @@ struct lg_magic_airmouse_state
 	s64 gyro_matrix[3][3];	/* rad/s per count, includes remap */
 	s64 accel_matrix[3][3];	/* m/s^2 per count, includes remap */
 	s64 gyro_scale[3];	/* raw-axis scales for the reference path */
-	s64 accel_scale;	/* m/s^2 per count summary */
+	s64 accel_scale[3];	/* raw-axis counts per g, 0 = unknown */
 	s64 sensitivity_x;	/* pixels per radian */
 	s64 sensitivity_y;	/* pixels per radian */
 	s64 dt;			/* seconds per report */
 	s64 gravity[3];		/* unit vector, accelerometer up */
 	s64 gravity_gain;	/* accelerometer correction, per second */
 	s64 gravity_gain_fast;	/* correction until the estimate is settled */
-	s64 accel_gate;		/* accepted deviation from 1 g, counts */
+	s64 accel_gate;		/* accepted deviation from 1 g, Q16.16 g */
 	s64 pointing[3];	/* unit vector, pointing axis */
 	s64 fallback_right[3];	/* device direction of raw +z, pre-gravity X */
 	s64 fallback_vertical[3];/* device direction of raw +x, pre-gravity Y */
