@@ -433,51 +433,6 @@ int lgmagic_parse_scd_matrices(const u8 *scd, size_t size,
 	return 0;
 }
 
-void lgmagic_airmouse_init(struct lg_magic_airmouse_state *state)
-{
-	memset(state, 0, sizeof(*state));
-
-	/* Algorithm constants only; calibration and UX fields start at zero. */
-	state->dt = LGMAGIC_DEFAULT_DT;
-	state->gravity_alpha = 6554;	/* 0.1 */
-	state->pointing[1] = LGMAGIC_FP_ONE;
-	state->deadzone = 1311;		/* 0.02 rad/s */
-	state->bias_beta = 1311;	/* 0.02 per report */
-	state->zero_rate = 3277;	/* 0.05 rad/s */
-	state->auto_bias = 0;
-	state->gravity_valid = 0;
-}
-
-int lgmagic_project(const s64 *omega, const s64 *gravity,
-		    const s64 *pointing, s64 *yaw, s64 *pitch)
-{
-	s64 g[3], p[3], h[3];
-	int i, ret;
-
-	for (i = 0; i < 3; i++)
-	{
-		g[i] = gravity[i];
-		p[i] = pointing[i];
-	}
-
-	ret = lgmagic_vec_normalize(g);
-	if (ret)
-		return ret;
-	ret = lgmagic_vec_normalize(p);
-	if (ret)
-		return ret;
-
-	lgmagic_fpcross(p, g, h);
-	ret = lgmagic_vec_normalize(h);
-	if (ret)
-		return ret;
-
-	*yaw = lgmagic_fpdot(omega, g);
-	*pitch = lgmagic_fpdot(omega, h);
-
-	return 0;
-}
-
 static void lgmagic_mat3_vec(const s64 m[3][3], const s64 v[3], s64 out[3])
 {
 	int i, j;
@@ -493,11 +448,136 @@ static void lgmagic_mat3_vec(const s64 m[3][3], const s64 v[3], s64 out[3])
 	}
 }
 
+/* v -= dt * (omega x v): rotate a world-fixed vector by the body rotation. */
+static void lgmagic_rotate_back(s64 v[3], const s64 omega[3], s64 dt)
+{
+	s64 c[3];
+	int i;
+
+	lgmagic_fpcross(omega, v, c);
+	for (i = 0; i < 3; i++)
+		v[i] -= lgmagic_fpmul(dt, c[i]);
+}
+
+/*
+ * Gravity estimation.
+ *
+ * The first sample whose magnitude is close to 1 g seeds the estimate
+ * immediately, so shaking the remote enables the pointer without first
+ * having to hold it still.  After that the gyro carries the up vector and
+ * the accelerometer corrects it:
+ *
+ *   - while still, the accelerometer *is* the direction of gravity, so the
+ *     estimate is replaced by it; this also repairs a bad startup seed
+ *     without reconnecting the remote;
+ *   - while moving, the gyro propagates the estimate and the accelerometer
+ *     corrects it.
+ *
+ * A fresh estimate has not been checked against a still accelerometer yet, so
+ * it learns fast: a startup sample taken during hand acceleration is corrected
+ * within a fraction of a second of normal motion, without waiting for a still
+ * period.  The first still sample confirms the estimate and switches to the
+ * slower, steadier gain, where hand acceleration no longer tilts the basis.
+ *
+ * The accelerometer is ignored while its magnitude is far from 1 g.
+ */
+static int lgmagic_update_gravity(struct lg_magic_airmouse_state *state,
+				  const s16 *accel, const s64 *omega,
+				  const s64 *unit)
+{
+	s64 g[3], gain, dev, speed2;
+	u64 n2, n;
+	bool a_ok, still;
+	int i;
+
+	n2 = (u64)((s64)accel[0] * accel[0]) +
+	     (u64)((s64)accel[1] * accel[1]) +
+	     (u64)((s64)accel[2] * accel[2]);
+	n = lgmagic_isqrt64(n2);
+	dev = (s64)n - LGMAGIC_ACCEL_COUNTS_PER_G;
+	if (dev < 0)
+		dev = -dev;
+	a_ok = dev <= state->accel_gate;
+
+	speed2 = lgmagic_fpdot(omega, omega);
+	still = speed2 < lgmagic_fpmul(state->zero_rate, state->zero_rate);
+
+	if (!state->gravity_valid)
+	{
+		/* Do not seed from a sample taken under linear acceleration. */
+		if (!a_ok)
+			return -EAGAIN;
+
+		for (i = 0; i < 3; i++)
+			state->gravity[i] = unit[i];
+		state->gravity_valid = 1;
+		state->gravity_settled = still;
+		return 0;
+	}
+
+	for (i = 0; i < 3; i++)
+		g[i] = state->gravity[i];
+
+	lgmagic_rotate_back(g, omega, state->dt);
+	if (lgmagic_vec_normalize(g))
+		return -EINVAL;
+
+	if (a_ok)
+	{
+		if (still)
+		{
+			for (i = 0; i < 3; i++)
+				g[i] = unit[i];
+			state->gravity_settled = 1;
+		}
+		else
+		{
+			s64 rate = state->gravity_settled ?
+				   state->gravity_gain :
+				   state->gravity_gain_fast;
+
+			gain = lgmagic_fpmul(rate, state->dt);
+			for (i = 0; i < 3; i++)
+				g[i] += lgmagic_fpmul(gain, unit[i] - g[i]);
+		}
+
+		if (lgmagic_vec_normalize(g))
+			return -EINVAL;
+	}
+
+	for (i = 0; i < 3; i++)
+		state->gravity[i] = g[i];
+
+	return 0;
+}
+
+void lgmagic_airmouse_init(struct lg_magic_airmouse_state *state)
+{
+	memset(state, 0, sizeof(*state));
+
+	/* Algorithm constants only; calibration and UX fields start at zero. */
+	state->dt = LGMAGIC_DEFAULT_DT;
+	state->gravity_gain = LGMAGIC_FP_ONE;
+	state->gravity_gain_fast = 10 * LGMAGIC_FP_ONE;
+	state->accel_gate = 4;		/* ~0.1 g, in accelerometer counts */
+	state->pointing[1] = LGMAGIC_FP_ONE;
+	/* Identity remap until the SCD supplies one (blob/raw devices). */
+	state->fallback_right[2] = LGMAGIC_FP_ONE;
+	state->fallback_vertical[0] = LGMAGIC_FP_ONE;
+	state->deadzone = 1311;		/* 0.02 rad/s */
+	state->bias_beta = 1311;	/* 0.02 per report */
+	state->zero_rate = 3277;	/* 0.05 rad/s */
+	state->auto_bias = 0;
+	state->gravity_valid = 0;
+}
+
 /* Rotate the fixed pointing axis from the gyro sensor frame. */
 void lgmagic_airmouse_set_remap(struct lg_magic_airmouse_state *state,
 				const s64 remap[3][3])
 {
 	s64 p[3] = { 0, LGMAGIC_FP_ONE, 0 };
+	s64 raw_x[3] = { LGMAGIC_FP_ONE, 0, 0 };
+	s64 raw_z[3] = { 0, 0, LGMAGIC_FP_ONE };
 
 	lgmagic_mat3_vec(remap, p, state->pointing);
 	if (lgmagic_vec_normalize(state->pointing))
@@ -506,14 +586,61 @@ void lgmagic_airmouse_set_remap(struct lg_magic_airmouse_state *state,
 		state->pointing[1] = LGMAGIC_FP_ONE;
 		state->pointing[2] = 0;
 	}
+
+	lgmagic_mat3_vec(remap, raw_z, state->fallback_right);
+	if (lgmagic_vec_normalize(state->fallback_right))
+	{
+		state->fallback_right[0] = 0;
+		state->fallback_right[1] = 0;
+		state->fallback_right[2] = LGMAGIC_FP_ONE;
+	}
+
+	lgmagic_mat3_vec(remap, raw_x, state->fallback_vertical);
+	if (lgmagic_vec_normalize(state->fallback_vertical))
+	{
+		state->fallback_vertical[0] = LGMAGIC_FP_ONE;
+		state->fallback_vertical[1] = 0;
+		state->fallback_vertical[2] = 0;
+	}
+}
+
+
+/*
+ * Approximate cursor motion before gravity has been acquired.  This is the
+ * pre-SCD fixed-axis mapping (raw z -> X, raw x -> Y) expressed in the device
+ * frame: the two directions are the SCD remap images of raw +z and raw +x, so
+ * the fallback shares the frame of the gravity path.  It is not used once
+ * gravity exists.
+ */
+static void lgmagic_fallback_mouse(const struct lg_magic_airmouse_state *state,
+				   const s64 *omega, s16 *mouse)
+{
+	s64 dxr, dyr, dx, dy;
+
+	dxr = lgmagic_fpdot(omega, state->fallback_right);
+	dyr = lgmagic_fpdot(omega, state->fallback_vertical);
+
+	if (lgmagic_fabs(dxr) < state->deadzone)
+		dxr = 0;
+	if (lgmagic_fabs(dyr) < state->deadzone)
+		dyr = 0;
+
+	dx = lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_x, dxr),
+			   state->dt);
+	dy = lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_y, dyr),
+			   state->dt);
+
+	mouse[0] = lgmagic_clamp_s16(dx / LGMAGIC_FP_ONE);
+	mouse[1] = lgmagic_clamp_s16(dy / LGMAGIC_FP_ONE);
 }
 
 int lgmagic_calc_mouse_gravity(struct lg_magic_airmouse_state *state,
 			       const s16 *gyro, const s16 *accel,
 			       s16 *mouse)
 {
-	s64 corr[3], omega[3], unit[3], yaw, pitch, dx, dy;
-	s64 speed2, limit2;
+	s64 corr[3], omega[3], unit[3];
+	s64 right[3], vertical[3], motion[3];
+	s64 dx = 0, dy = 0, dxr, dyr, speed2, limit2;
 	int i;
 
 	mouse[0] = 0;
@@ -568,40 +695,46 @@ int lgmagic_calc_mouse_gravity(struct lg_magic_airmouse_state *state,
 		return 0;
 	}
 
-	if (!state->gravity_valid)
+	if (lgmagic_update_gravity(state, accel, omega, unit))
 	{
-		for (i = 0; i < 3; i++)
-			state->gravity[i] = unit[i];
-		state->gravity_valid = 1;
-	}
-	else
-	{
-		for (i = 0; i < 3; i++)
-			state->gravity[i] =
-				lgmagic_fpmul(LGMAGIC_FP_ONE -
-					      state->gravity_alpha,
-					      state->gravity[i]) +
-				lgmagic_fpmul(state->gravity_alpha, unit[i]);
-
-		if (lgmagic_vec_normalize(state->gravity))
-		{
-			for (i = 0; i < 3; i++)
-				state->gravity[i] = unit[i];
-		}
+		/*
+		 * Gravity is not usable yet.  Move approximately on the raw
+		 * axes so the shake visibly enters pointer mode; the exact
+		 * gravity basis takes over as soon as a usable sample
+		 * arrives.
+		 */
+		lgmagic_fallback_mouse(state, omega, mouse);
+		limit2 = lgmagic_fpmul(state->threshold, state->threshold);
+		return speed2 > limit2;
 	}
 
-	if (lgmagic_project(omega, state->gravity, state->pointing,
-			    &yaw, &pitch))
+	/*
+	 * Instantaneous screen basis.  Gravity supplies the vertical; the
+	 * fixed pointing axis supplies the screen normal.  There is no stored
+	 * screen-forward or initial yaw: every report is independent of how
+	 * the remote was held at probe time.
+	 */
+	lgmagic_fpcross(state->gravity, state->pointing, right);
+	if (lgmagic_vec_normalize(right))
+		return 0;
+	lgmagic_fpcross(state->pointing, right, vertical);
+	if (lgmagic_vec_normalize(vertical))
 		return 0;
 
-	if (lgmagic_fabs(yaw) < state->deadzone)
-		yaw = 0;
-	if (lgmagic_fabs(pitch) < state->deadzone)
-		pitch = 0;
+	/* Motion of the pointing vector; a roll around it cancels. */
+	lgmagic_fpcross(omega, state->pointing, motion);
 
-	dx = -lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_x, yaw),
+	dxr = lgmagic_fpdot(motion, right);
+	dyr = lgmagic_fpdot(motion, vertical);
+
+	if (lgmagic_fabs(dxr) < state->deadzone)
+		dxr = 0;
+	if (lgmagic_fabs(dyr) < state->deadzone)
+		dyr = 0;
+
+	dx = -lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_x, dxr),
 			    state->dt);
-	dy = -lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_y, pitch),
+	dy = -lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_y, dyr),
 			    state->dt);
 
 	mouse[0] = lgmagic_clamp_s16(dx / LGMAGIC_FP_ONE);
@@ -610,4 +743,57 @@ int lgmagic_calc_mouse_gravity(struct lg_magic_airmouse_state *state,
 	limit2 = lgmagic_fpmul(state->threshold, state->threshold);
 
 	return speed2 > limit2;
+}
+
+/*
+ * Fixed-axis reference path.  This is the original working mapping
+ * dx = +gyro_z, dy = +gyro_x; the gravity path is checked against it at a
+ * level grip.
+ */
+int lgmagic_calc_mouse(struct lg_magic_airmouse_state *state,
+		       const s16 *gyro, s16 *mouse)
+{
+	s64 rate[3], speed2, dx, dy;
+	int i;
+
+	mouse[0] = 0;
+	mouse[1] = 0;
+
+	if (!state->gyro_valid)
+		return 0;
+
+	for (i = 0; i < 3; i++)
+	{
+		s64 corr = (s64)gyro[i] * LGMAGIC_FP_ONE -
+			   state->gyro_bias[i];
+
+		rate[i] = lgmagic_fpmul(corr, state->gyro_scale[i]);
+	}
+
+	speed2 = (rate[0] * rate[0] + rate[1] * rate[1] +
+		  rate[2] * rate[2]) / LGMAGIC_FP_ONE;
+
+	if (state->auto_bias &&
+	    speed2 < lgmagic_fpmul(state->zero_rate, state->zero_rate))
+	{
+		for (i = 0; i < 3; i++)
+		{
+			s64 raw = (s64)gyro[i] * LGMAGIC_FP_ONE;
+
+			state->gyro_bias[i] +=
+				lgmagic_fpmul(state->bias_beta,
+					      raw - state->gyro_bias[i]);
+		}
+	}
+
+	dx = lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_x, rate[2]),
+			   state->dt);
+	dy = lgmagic_fpmul(lgmagic_fpmul(state->sensitivity_y, rate[0]),
+			   state->dt);
+
+	mouse[0] = lgmagic_clamp_s16(dx / LGMAGIC_FP_ONE);
+	mouse[1] = lgmagic_clamp_s16(dy / LGMAGIC_FP_ONE);
+
+	return lgmagic_fabs(rate[0]) > state->threshold ||
+	       lgmagic_fabs(rate[2]) > state->threshold;
 }

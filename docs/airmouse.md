@@ -1,72 +1,45 @@
 # Air mouse reference
 
-The driver uses the remote's SCD (Sensor Calibration Data) and provides pointer
-control without a calibration file. A per-unit calibration blob is available as
-an optional precision upgrade.
+The driver provides air-mouse control from the remote's SCD (Sensor
+Calibration Data), with an optional per-unit calibration blob for precision.
 
 ## Tuning
 
 Per-device `airmouse`, `airmouse_threshold`, `sensitivity_x` and
 `sensitivity_y` are described in the main README's
 [Configuration](../README.md#configuration) section. `motion` is a read-only
-diagnostic attribute. Module parameters are probe-time defaults.
+diagnostic attribute; module parameters are probe-time defaults.
 
 ## Zero-config SCD path
 
-The driver requests the SCD with `F9 17` and parses:
+The driver requests the SCD with `F9 17` and uses:
 
-- report period at float 0 (bytes 9..12), `0.01` on the MR19/MR20;
-- accelerometer matrix at floats 2..10 (bytes 17..52);
-- gyroscope matrix at floats 24..32 (bytes 105..140).
+- report period at float 0 (`0.01` on tested units);
+- accelerometer matrix at floats 2..10;
+- gyroscope matrix at floats 24..32.
 
-The report period overrides the 10 ms default and is used for the cursor gain
-and the auto-bias timing.
+The report period drives the cursor gain, gravity propagation and auto-bias.
+The gyro matrix maps raw counts to angular velocity in the device frame; the
+accelerometer matrix maps raw counts to the up direction. The gyro matrix is
+also decomposed into a rotation (the remap) and per-axis scales; the remap
+rotates the pointing axis.
 
-The request is skipped when a validated table is already cached for the
-remote's MAC address; the cache keeps the raw payload and re-parses it.
+Each matrix must decompose into a proper rotation and per-axis scales; invalid
+payloads are rejected. A validated table is cached by MAC and re-parsed on
+reconnect.
 
-Each matrix is a scale times an axis remap. The driver applies the matrix as it
-is; it does not require a specific rotation. Validation only checks that the
-matrix can be decomposed into a proper rotation (`det +1`) and per-axis scales.
-Reflections, singular matrices and malformed payloads are rejected.
-
-The fixed pointing axis is rotated by the gyro remap. The accelerometer matrix
-independently maps the accelerometer into the same device frame; the two
-matrices may therefore use different rotations, for example when the gyro and
-accelerometer are separate chips with non-aligned sensor frames.
-
-The SCD has no per-unit gyro bias. On the SCD-only path the driver updates the
-bias while the remote is still:
-
-```
-bias += beta * (raw - bias)
-```
-
-with a conservative per-report `beta`; the update is skipped when the angular
-speed is above the still threshold. A valid calibration blob disables
-auto-bias and keeps its measured bias fixed.
-
-A validated SCD table is cached in memory per MAC address, including the raw
-payload. On reconnect the driver reuses it and does not request the SCD again.
-Only a complete 260-byte table with two valid matrices is cached; a truncated
-or malformed response cannot poison the cache.
+The SCD has no per-unit gyro bias; the driver learns it while the remote is
+still. A valid calibration blob disables auto-bias and keeps its measured bias.
 
 ## Optional per-unit calibration
 
 ### Blob format
 
-Version 1 is a 40-byte little-endian fixed-point record:
-
-- magic `LGC2`, version 1, size 40;
-- `gyro_bias[3]` in raw counts;
-- `gyro_scale[3]` in deg/s per count on disk (the driver converts to rad/s);
-- `alpha` and `mouse_k`, legacy fields that the driver ignores and reads only
-  to log a one-time deprecation warning.
-
-Only `gyro_bias` and `gyro_scale` are physical. A zero or negative scale makes
-the blob invalid; the driver logs a warning and falls back to SCD. A blob with
-a zero bias is still a valid file and disables auto-bias, so measure the bias
-before installing it.
+Version 1 is a 40-byte little-endian fixed-point record: magic `LGC2`,
+version 1, size 40, `gyro_bias[3]` in raw counts and `gyro_scale[3]` in
+deg/s per count. Two legacy fields (`alpha`, `mouse_k`) are ignored. Only
+`gyro_bias` and `gyro_scale` are physical. A zero or negative scale makes the
+blob invalid; a zero bias is valid and disables auto-bias.
 
 Firmware lookup order:
 
@@ -76,90 +49,61 @@ Firmware lookup order:
 
 ### Capturing a calibration
 
-Load the module with `imu_evdev=1` and use the capture/calibration tools
-described in [scripts.md](scripts.md#calibration). Install the resulting blob
-under `/lib/firmware/` as above. A valid blob overrides the SCD gyro scale/bias
-for that unit.
+Load the module with `imu_evdev=1` and use the tools in
+[scripts.md](scripts.md#calibration). Install the blob under `/lib/firmware/`.
+A valid blob overrides the SCD gyro scale/bias for that unit.
 
 ## Algorithm
 
 All report-path calculations use Q16.16 fixed point.
 
-1. Correct the raw gyro by the bias in counts.
-2. Apply the gyro matrix: angular velocity in rad/s, same frame as the remote.
-3. Apply the accelerometer matrix and normalize the result into a gravity
-   direction.
-4. Low-pass filter gravity and project angular velocity onto gravity-defined
-   axes:
-
-   ```
-   yaw   = omega . gravity
-   h     = normalize(pointing x gravity)
-   pitch = omega . h
-   ```
-
-   A roll about the pointing axis produces no cursor motion.
-5. Apply a small dead zone. Shake detection compares the raw angular speed
-   with `airmouse_threshold`.
-6. Shake enters pointer mode. A mapped button press returns to button mode. In
-   button mode the wheel is UP/DOWN; in pointer mode it is a normal wheel and
-   the wheel button is `BTN_LEFT`.
-7. Cursor pixels are `-sensitivity * rate * dt`, with X and Y independent.
+- Correct the gyro by bias and map it to the device frame.
+- Apply the accelerometer matrix and normalize; the sensor reports specific
+  force, so this is the up vector.
+- Track gravity with the gyro and correct it with the accelerometer. Ignore a
+  sample when its magnitude is far from 1g. While still, replace the estimate
+  with the accelerometer; otherwise correct toward it. A new estimate learns
+  fast until a still sample confirms it, then tracks slowly, so a bad startup
+  sample is repaired without putting the remote down.
+- Build the cursor basis from the current up vector and the fixed pointing
+  axis `p`. Motion is `omega x p` projected on that basis, so a roll around
+  `p` cancels. No stored screen-forward or initial yaw is used.
+- Before gravity is available, move the pointer on the raw `z`/`x` axes
+  (remapped into the device frame) for immediate feedback.
+- Shake enters pointer mode; a mapped button returns to button mode. In button
+  mode the wheel is UP/DOWN; in pointer mode it is a normal wheel and the wheel
+  button is `BTN_LEFT`.
 
 ## SCD fields used
 
-The SCD payload is 260 bytes. The float array starts at byte 9, not after the
-5-byte magic; float *k* occupies bytes `9 + 4k .. 12 + 4k`.
+The SCD payload is 260 bytes. The float array starts at byte 9; float k is at
+`9 + 4k`.
 
 | Floats | Bytes | Use |
 |---|---|---|
-| `0` | `9..12` | report period in seconds (`0.01` on tested units) |
-| `2..10` | `17..52` | accelerometer scale/remap matrix |
-| `24..32` | `105..140` | gyroscope scale/remap matrix |
+| 0 | 9..12 | report period |
+| 2..10 | 17..52 | accelerometer matrix |
+| 24..32 | 105..140 | gyroscope matrix |
 
-The remaining SCD fields are not used by the driver and are not documented
-here.
+The remaining SCD fields are not used by the driver.
 
 ## Troubleshooting
 
-Check the kernel log:
+Check `dmesg | grep lg_magic` for SCD and calibration messages. `airmouse`,
+`motion` and the tuning attributes are under
+`/sys/bus/hid/devices/*/airmouse`.
 
-```bash
-dmesg | grep lg_magic
-```
+If the pointer does not move, confirm `airmouse=1` and shake the remote; with
+no SCD and no blob the pointer is disabled while buttons and the wheel keep
+working.
 
-The driver logs when the SCD is complete, when the matrices are accepted, and
-when a table is unusable or no SCD response arrives.
-
-Find the device attributes and inspect the air mouse state:
-
-```bash
-ls /sys/bus/hid/devices/*/airmouse
-cat /sys/bus/hid/devices/*/airmouse
-cat /sys/bus/hid/devices/*/motion
-```
-
-If the pointer does not move:
-
-- confirm `airmouse` is `1`;
-- shake the remote to enter pointer mode;
-- if there is no SCD and no blob, the pointer is intentionally disabled while
-  buttons and the wheel keep working;
-- check `dmesg` for a malformed SCD or a missing firmware file.
-
-If the cursor drifts on the SCD-only path, let the remote lie still for a few
-seconds so auto-bias can settle. With a blob, auto-bias is off by design;
-re-measure the bias or remove the blob. Axis inversion is not a supported
-option: an inversion means the calibration or the physical assumption is
-wrong.
+If it drifts, let the remote lie still so auto-bias can settle. If the axes
+look wrong, hold it still for a moment so gravity is replaced by the
+accelerometer; otherwise the sensor frame or pointing axis is wrong.
 
 ## Testing
 
-```bash
-make -C tests check
-```
-
-The C tests cover the SCD offsets against a real 260-byte payload, matrix
-validation, the blob format and units, the gravity projection, cursor signs
-and auto-bias convergence. The conversion tooling has its own tests; see
+`make -C tests check` covers SCD parsing, matrix/blob validation, the
+projection and its roll/tilt invariants, gravity seeding and recovery, the
+pre-gravity fallback, and auto-bias. The conversion tooling is tested in
 [scripts.md](scripts.md#tests).

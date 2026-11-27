@@ -315,7 +315,7 @@ static void lgmagic_scd_cache_store(const char *uniq, const u8 *raw)
 	spin_unlock_irqrestore(&lgmagic_scd_cache_lock, flags);
 }
 
-/* A blob wins over the SCD gyro matrix; the accel matrix is still useful. */
+/* A blob keeps its raw-frame calibration; the SCD supplies zero-config data. */
 static void lgmagic_apply_scd(struct lgmagic_drvdata *drvdata,
 			      const s64 gyro_matrix[3][3],
 			      const s64 accel_matrix[3][3],
@@ -329,9 +329,6 @@ static void lgmagic_apply_scd(struct lgmagic_drvdata *drvdata,
 	if (sample_dt > 0)
 		drvdata->airmouse.dt = sample_dt;
 
-	drvdata->airmouse.accel_scale = accel_scale;
-
-	/* A blob is raw-frame; do not mix it with the SCD remap. */
 	if (drvdata->blob_valid)
 		return;
 
@@ -341,9 +338,12 @@ static void lgmagic_apply_scd(struct lgmagic_drvdata *drvdata,
 	       sizeof(drvdata->airmouse.accel_matrix));
 	for (i = 0; i < 3; i++)
 		drvdata->airmouse.gyro_scale[i] = gyro_scale[i];
+	drvdata->airmouse.accel_scale = accel_scale;
 	lgmagic_airmouse_set_remap(&drvdata->airmouse, gyro_remap);
+	drvdata->airmouse.gravity_valid = 0;
 	drvdata->airmouse.gyro_matrix_valid = 1;
 	drvdata->airmouse.accel_matrix_valid = 1;
+	drvdata->airmouse.gyro_valid = 1;
 	drvdata->airmouse.auto_bias = 1;
 	drvdata->pointer_ready = true;
 }
@@ -917,10 +917,20 @@ static int lgmagic_load_fw(const char *fwname, struct device *dev, struct lgmagi
 	for (i = 0; i < 3; i++)
 	{
 		drvdata->airmouse.gyro_bias[i] = bias[i];
+		drvdata->airmouse.gyro_scale[i] = scale[i];
 		drvdata->airmouse.gyro_matrix[i][i] = scale[i];
 	}
 
+	/* The blob is raw-frame: no SCD remap, raw accelerometer. */
+	drvdata->airmouse.pointing[0] = 0;
+	drvdata->airmouse.pointing[1] = LGMAGIC_FP_ONE;
+	drvdata->airmouse.pointing[2] = 0;
+	drvdata->airmouse.accel_matrix_valid = 0;
+	drvdata->airmouse.accel_scale = 0;
+	drvdata->airmouse.gravity_valid = 0;
 	drvdata->airmouse.gyro_matrix_valid = 1;
+	drvdata->airmouse.gyro_valid = 1;
+	drvdata->airmouse.dt = LGMAGIC_DEFAULT_DT;
 	drvdata->blob_valid = true;
 	drvdata->pointer_ready = true;
 

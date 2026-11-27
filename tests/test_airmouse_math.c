@@ -18,25 +18,63 @@ static int failures;
 		}                                                            \
 	} while (0)
 
+#define GYRO_SCALE	0.0010652969358488917	/* rad/s per count */
+
 static s64 q16(double value)
 {
 	return (s64)llround(value * LGMAGIC_FP_ONE);
 }
 
-static void mat_identity(s64 m[3][3])
+
+static void make_rz90(s64 m[3][3])
 {
-	memset(m, 0, sizeof(s64) * 9);
-	m[0][0] = LGMAGIC_FP_ONE;
-	m[1][1] = LGMAGIC_FP_ONE;
+	m[0][0] = 0;
+	m[0][1] = -LGMAGIC_FP_ONE;
+	m[0][2] = 0;
+	m[1][0] = LGMAGIC_FP_ONE;
+	m[1][1] = 0;
+	m[1][2] = 0;
+	m[2][0] = 0;
+	m[2][1] = 0;
 	m[2][2] = LGMAGIC_FP_ONE;
 }
 
-static void mat_rz90(s64 m[3][3])
+static void make_rz90_scaled(s64 m[3][3], double scale)
 {
-	memset(m, 0, sizeof(s64) * 9);
-	m[0][1] = -LGMAGIC_FP_ONE;
-	m[1][0] = LGMAGIC_FP_ONE;
-	m[2][2] = LGMAGIC_FP_ONE;
+	s64 s = q16(scale);
+
+	m[0][0] = 0;
+	m[0][1] = -s;
+	m[0][2] = 0;
+	m[1][0] = s;
+	m[1][1] = 0;
+	m[1][2] = 0;
+	m[2][0] = 0;
+	m[2][1] = 0;
+	m[2][2] = s;
+}
+
+static double gravity_angle_deg(const s64 g[3], const s16 accel[3])
+{
+	double a[3], b[3], na = 0.0, nb = 0.0, dot = 0.0;
+	int i;
+
+	for (i = 0; i < 3; i++)
+	{
+		a[i] = (double)g[i];
+		b[i] = (double)accel[i];
+		na += a[i] * a[i];
+		nb += b[i] * b[i];
+		dot += a[i] * b[i];
+	}
+	if (na <= 0.0 || nb <= 0.0)
+		return 180.0;
+	dot /= sqrt(na * nb);
+	if (dot > 1.0)
+		dot = 1.0;
+	if (dot < -1.0)
+		dot = -1.0;
+	return acos(dot) * 180.0 / M_PI;
 }
 
 static struct lg_magic_airmouse_state make_state(void)
@@ -44,16 +82,435 @@ static struct lg_magic_airmouse_state make_state(void)
 	struct lg_magic_airmouse_state state;
 
 	lgmagic_airmouse_init(&state);
-	mat_identity(state.gyro_matrix);
-	state.gyro_matrix_valid = 1;
-	state.sensitivity_x = LGMAGIC_FP_ONE;
-	state.sensitivity_y = LGMAGIC_FP_ONE;
+
+	state.gyro_scale[0] = q16(GYRO_SCALE);
+	state.gyro_scale[1] = q16(GYRO_SCALE);
+	state.gyro_scale[2] = q16(GYRO_SCALE);
+	state.gyro_valid = 1;
+	state.sensitivity_x = 1000LL << LGMAGIC_FP_SHIFT;
+	state.sensitivity_y = 1000LL << LGMAGIC_FP_SHIFT;
 	state.dt = LGMAGIC_FP_ONE;
-	state.deadzone = 0;
-	state.gravity_valid = 1;
-	state.gravity[2] = -LGMAGIC_FP_ONE;
+	state.threshold = 100 * LGMAGIC_FP_ONE;
 
 	return state;
+}
+
+/*
+ * The pre-SCD working driver used exactly dx = +gyro_z * scale_z and
+ * dy = +gyro_x * scale_x.  These tests pin that mapping down: changing
+ * the axis or the sign must fail here, not on the user's desk.
+ */
+static void test_baseline_axes_and_signs(void)
+{
+	struct lg_magic_airmouse_state state;
+	s16 gyro[3];
+	s16 mouse[2];
+
+	/* Only gyro_z: horizontal motion, no vertical coupling. */
+	state = make_state();
+	gyro[0] = 0;
+	gyro[1] = 0;
+	gyro[2] = 1000;
+	lgmagic_calc_mouse(&state, gyro, mouse);
+	CHECK(mouse[0] > 0);
+	CHECK(mouse[1] == 0);
+
+	/* Only gyro_x: vertical motion, no horizontal coupling. */
+	state = make_state();
+	gyro[0] = 1000;
+	gyro[1] = 0;
+	gyro[2] = 0;
+	lgmagic_calc_mouse(&state, gyro, mouse);
+	CHECK(mouse[0] == 0);
+	CHECK(mouse[1] > 0);
+
+	/* Negative rates move in the opposite direction. */
+	state = make_state();
+	gyro[0] = -1000;
+	gyro[1] = 0;
+	gyro[2] = -1000;
+	lgmagic_calc_mouse(&state, gyro, mouse);
+	CHECK(mouse[0] < 0);
+	CHECK(mouse[1] < 0);
+
+	/* gyro_y must not leak into either cursor axis. */
+	state = make_state();
+	gyro[0] = 0;
+	gyro[1] = 1000;
+	gyro[2] = 0;
+	lgmagic_calc_mouse(&state, gyro, mouse);
+	CHECK(mouse[0] == 0);
+	CHECK(mouse[1] == 0);
+}
+
+
+static struct lg_magic_airmouse_state make_gravity_state(void)
+{
+	struct lg_magic_airmouse_state state;
+
+	lgmagic_airmouse_init(&state);
+	state.gyro_matrix[0][0] = q16(GYRO_SCALE);
+	state.gyro_matrix[1][1] = q16(GYRO_SCALE);
+	state.gyro_matrix[2][2] = q16(GYRO_SCALE);
+	state.gyro_scale[0] = q16(GYRO_SCALE);
+	state.gyro_scale[1] = q16(GYRO_SCALE);
+	state.gyro_scale[2] = q16(GYRO_SCALE);
+	state.gyro_matrix_valid = 1;
+	state.gyro_valid = 1;
+	/* Canonical pointing axis for raw +Y under Rz90. */
+	state.pointing[0] = -LGMAGIC_FP_ONE;
+	state.pointing[1] = 0;
+	state.pointing[2] = 0;
+	state.sensitivity_x = 1000LL << LGMAGIC_FP_SHIFT;
+	state.sensitivity_y = 1000LL << LGMAGIC_FP_SHIFT;
+	state.dt = LGMAGIC_DEFAULT_DT;
+	/* Isolate the projection geometry from the accelerometer correction. */
+	state.gravity_valid = 1;
+	state.gravity[2] = -LGMAGIC_FP_ONE;
+	state.gravity_gain = 0;
+	state.gravity_gain_fast = 0;
+	state.deadzone = 0;
+	state.threshold = 100 * LGMAGIC_FP_ONE;
+	state.accel_gate = 4;
+
+	return state;
+}
+
+/*
+ * At a level grip the gravity projection must reduce to the fixed-axis
+ * baseline: canonical z (raw z) drives X, canonical y (raw x) drives Y.
+ */
+static void test_gravity_projection_matches_baseline(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s16 zero[3] = { 0, 0, 0 };
+	s16 up[3] = { 0, 0, -41 };
+	s16 gyro[3];
+	s16 mouse[2];
+
+	/* First report initialises gravity and the screen basis. */
+	lgmagic_calc_mouse_gravity(&state, zero, up, mouse);
+
+	gyro[0] = 0;
+	gyro[1] = 0;
+	gyro[2] = 1000;
+	lgmagic_calc_mouse_gravity(&state, gyro, up, mouse);
+	CHECK(mouse[0] > 0);
+	CHECK(mouse[1] == 0);
+
+	state = make_gravity_state();
+	lgmagic_calc_mouse_gravity(&state, zero, up, mouse);
+	gyro[0] = 0;
+	gyro[1] = 1000;
+	gyro[2] = 0;
+	lgmagic_calc_mouse_gravity(&state, gyro, up, mouse);
+	CHECK(mouse[0] == 0);
+	CHECK(mouse[1] > 0);
+
+	/* A roll around the pointing axis must not move the cursor. */
+	state = make_gravity_state();
+	lgmagic_calc_mouse_gravity(&state, zero, up, mouse);
+	gyro[0] = 1000;
+	gyro[1] = 0;
+	gyro[2] = 0;
+	lgmagic_calc_mouse_gravity(&state, gyro, up, mouse);
+	CHECK(llabs(mouse[0]) <= 2);
+	CHECK(llabs(mouse[1]) <= 2);
+}
+
+
+static void test_gravity_seed_and_recovery(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s16 zero[3] = { 0, 0, 0 };
+	s16 bad[3] = { 41, 0, -41 };	/* 1.4 g, hand acceleration */
+	s16 up[3] = { 0, 0, -41 };
+	s16 shake[3] = { 5000, 5000, 5000 };
+	s16 mouse[2];
+
+	/* A sample under linear acceleration must not become the reference. */
+	state.gravity_valid = 0;
+	state.gravity_gain = LGMAGIC_FP_ONE;
+	CHECK(lgmagic_calc_mouse_gravity(&state, zero, bad, mouse) == 0);
+	CHECK(state.gravity_valid == 0);
+
+	/*
+	 * A shake with a valid 1 g sample seeds gravity on the same report,
+	 * so the pointer activates immediately instead of waiting for a
+	 * still period.  The next report already moves the cursor.
+	 */
+	state = make_gravity_state();
+	state.gravity_valid = 0;
+	state.threshold = q16(1.0);
+	CHECK(lgmagic_calc_mouse_gravity(&state, shake, up, mouse) == 1);
+	CHECK(state.gravity_valid == 1);
+	CHECK(state.gravity_settled == 0);
+	lgmagic_calc_mouse_gravity(&state, shake, up, mouse);
+	CHECK(mouse[0] != 0 || mouse[1] != 0);
+
+	/*
+	 * A shake without a usable accelerometer still enters pointer mode and
+	 * moves the cursor on the raw axes.
+	 */
+	state = make_gravity_state();
+	state.gravity_valid = 0;
+	state.threshold = q16(1.0);
+	CHECK(lgmagic_calc_mouse_gravity(&state, shake, bad, mouse) == 1);
+	CHECK(state.gravity_valid == 0);
+	CHECK(mouse[0] != 0 && mouse[1] != 0);
+
+	/* A still 1 g sample seeds gravity on its own. */
+	state = make_gravity_state();
+	state.gravity_valid = 0;
+	lgmagic_calc_mouse_gravity(&state, zero, up, mouse);
+	CHECK(state.gravity_valid == 1);
+	CHECK(state.gravity_settled == 1);
+	CHECK(llabs(state.gravity[0]) < 8);
+	CHECK(llabs(state.gravity[1]) < 8);
+	CHECK(llabs(state.gravity[2] + LGMAGIC_FP_ONE) < 8);
+
+	/*
+	 * A wrong seed is repaired by the first still 1 g sample, so a bad
+	 * startup orientation does not survive until the next reconnect.
+	 */
+	state = make_gravity_state();
+	state.gravity[0] = LGMAGIC_FP_ONE;
+	state.gravity[1] = 0;
+	state.gravity[2] = 0;
+	lgmagic_calc_mouse_gravity(&state, zero, up, mouse);
+	CHECK(llabs(state.gravity[0]) < 8);
+	CHECK(llabs(state.gravity[1]) < 8);
+	CHECK(llabs(state.gravity[2] + LGMAGIC_FP_ONE) < 8);
+}
+
+
+/*
+ * A seed taken during hand motion may be tens of degrees off.  Until the
+ * estimate is confirmed while still it must learn fast, so normal motion is
+ * enough to repair it; after confirmation it must track slowly so that hand
+ * acceleration does not tilt the basis.
+ */
+static void test_gravity_fast_learning_until_settled(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s16 zero[3] = { 0, 0, 0 };
+	s16 moving[3] = { 60, 0, 0 };	/* ~0.064 rad/s, above zero_rate */
+	s16 up[3] = { 0, 0, -41 };
+	s16 mouse[2];
+	const s64 bad_x = q16(sin(27.0 * M_PI / 180.0));
+	const s64 bad_z = -q16(cos(27.0 * M_PI / 180.0));
+	int i;
+
+	state.gravity_valid = 1;
+	state.gravity_settled = 0;
+	state.gravity[0] = bad_x;
+	state.gravity[1] = 0;
+	state.gravity[2] = bad_z;
+	state.gravity_gain = LGMAGIC_FP_ONE;
+	state.gravity_gain_fast = 10 * LGMAGIC_FP_ONE;
+
+	for (i = 0; i < 20; i++)
+		lgmagic_calc_mouse_gravity(&state, moving, up, mouse);
+	CHECK(state.gravity_settled == 0);
+	CHECK(gravity_angle_deg(state.gravity, up) < 5.0);
+
+	/* One still report confirms the estimate. */
+	lgmagic_calc_mouse_gravity(&state, zero, up, mouse);
+	CHECK(state.gravity_settled == 1);
+	CHECK(gravity_angle_deg(state.gravity, up) < 1.0);
+
+	/* After that, a disturbance is rejected rather than chased. */
+	state.gravity[0] = bad_x;
+	state.gravity[1] = 0;
+	state.gravity[2] = bad_z;
+	for (i = 0; i < 20; i++)
+		lgmagic_calc_mouse_gravity(&state, moving, up, mouse);
+	CHECK(gravity_angle_deg(state.gravity, up) > 10.0);
+}
+
+
+/*
+ * Before gravity exists the pointer must still move, using the pre-SCD raw
+ * axes, so the user can tell that the shake was accepted.  Once gravity is
+ * seeded the fallback must not be used.
+ */
+static void test_gravity_fallback_before_seed(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s16 up[3] = { 0, 0, -41 };
+	s16 bad[3] = { 41, 0, -41 };	/* 1.4 g, cannot seed */
+	s16 z_only[3] = { 0, 0, 4000 };
+	s16 x_only[3] = { 4000, 0, 0 };
+	s16 mouse[2];
+
+	/* Raw +z drives X, raw +x drives Y, with the known-good signs. */
+	state.gravity_valid = 0;
+	state.threshold = q16(1.0);
+	CHECK(lgmagic_calc_mouse_gravity(&state, z_only, bad, mouse) == 1);
+	CHECK(state.gravity_valid == 0);
+	CHECK(mouse[0] > 0);
+	CHECK(mouse[1] == 0);
+
+	state = make_gravity_state();
+	state.gravity_valid = 0;
+	state.threshold = q16(1.0);
+	CHECK(lgmagic_calc_mouse_gravity(&state, x_only, bad, mouse) == 1);
+	CHECK(mouse[0] == 0);
+	CHECK(mouse[1] > 0);
+
+	/* A still remote before the seed has no fallback drift. */
+	state = make_gravity_state();
+	state.gravity_valid = 0;
+	{
+		s16 zero[3] = { 0, 0, 0 };
+
+		lgmagic_calc_mouse_gravity(&state, zero, bad, mouse);
+		CHECK(mouse[0] == 0 && mouse[1] == 0);
+	}
+
+	/* Once a usable sample seeds gravity, the basis path takes over. */
+	state = make_gravity_state();
+	state.gravity_valid = 0;
+	state.threshold = q16(1.0);
+	lgmagic_calc_mouse_gravity(&state, z_only, up, mouse);
+	CHECK(state.gravity_valid == 1);
+	CHECK(llabs(state.gravity[0]) < 8);
+	CHECK(llabs(state.gravity[2] + LGMAGIC_FP_ONE) < 8);
+}
+
+
+/* The pre-gravity fallback must use the same remap as the gravity path. */
+static void test_fallback_basis_uses_remap(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s64 rz90[3][3];
+
+	make_rz90(rz90);
+	lgmagic_airmouse_set_remap(&state, rz90);
+
+	/* raw +Y (pointing), raw +z (X) and raw +x (Y) in the device frame. */
+	CHECK(llabs(state.pointing[0] + LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(state.pointing[1]) < 8);
+	CHECK(llabs(state.pointing[2]) < 8);
+
+	CHECK(llabs(state.fallback_right[0]) < 8);
+	CHECK(llabs(state.fallback_right[1]) < 8);
+	CHECK(llabs(state.fallback_right[2] - LGMAGIC_FP_ONE) < 8);
+
+	CHECK(llabs(state.fallback_vertical[0]) < 8);
+	CHECK(llabs(state.fallback_vertical[1] - LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(state.fallback_vertical[2]) < 8);
+}
+
+
+/*
+ * The accelerometer matrix, not the raw axes, defines up.  Under Rz90 a raw
+ * +X sample points along device +Y.
+ */
+static void test_accel_up_vector_uses_matrix(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s16 zero[3] = { 0, 0, 0 };
+	s16 accel[3] = { 41, 0, 0 };
+	s16 mouse[2];
+
+	make_rz90(state.accel_matrix);
+	state.accel_matrix_valid = 1;
+	state.gravity_valid = 0;
+	lgmagic_calc_mouse_gravity(&state, zero, accel, mouse);
+
+	CHECK(state.gravity_valid == 1);
+	CHECK(llabs(state.gravity[0]) < 8);
+	CHECK(llabs(state.gravity[1] - LGMAGIC_FP_ONE) < 8);
+	CHECK(llabs(state.gravity[2]) < 8);
+}
+
+/*
+ * A rotation about the world vertical must be pure cursor-X at any tilt:
+ * the vertical component of motion = omega x p cancels.  This is the
+ * property that used to leak into Y before the basis was rebuilt.
+ */
+static void test_gravity_projection_is_tilt_invariant(void)
+{
+	static const double angles[] = { 0.0, 30.0, 45.0, -30.0 };
+	const double pi = 3.14159265358979323846;
+	s16 up[3] = { 0, 0, -41 };
+	unsigned int i;
+
+	for (i = 0; i < sizeof(angles) / sizeof(angles[0]); i++)
+	{
+		struct lg_magic_airmouse_state state = make_gravity_state();
+		double a = angles[i] * pi / 180.0;
+		s16 gyro[3];
+		s16 mouse[2];
+
+		state.gravity[0] = q16(-sin(a));
+		state.gravity[1] = 0;
+		state.gravity[2] = q16(-cos(a));
+
+		/* omega = gravity: a rotation about the world vertical. */
+		gyro[0] = (s16)llround(-sin(a) / GYRO_SCALE);
+		gyro[1] = 0;
+		gyro[2] = (s16)llround(-cos(a) / GYRO_SCALE);
+
+		lgmagic_calc_mouse_gravity(&state, gyro, up, mouse);
+		CHECK(mouse[0] < 0);
+		CHECK(llabs(mouse[1]) <= 1);
+
+		/* A roll around p at the same tilt must not move the cursor. */
+		state.gravity[0] = q16(-sin(a));
+		state.gravity[1] = 0;
+		state.gravity[2] = q16(-cos(a));
+		gyro[0] = (s16)llround(-1.0 / GYRO_SCALE);
+		gyro[1] = 0;
+		gyro[2] = 0;
+		lgmagic_calc_mouse_gravity(&state, gyro, up, mouse);
+		CHECK(llabs(mouse[0]) <= 1);
+		CHECK(llabs(mouse[1]) <= 1);
+	}
+}
+
+/*
+ * With both the gyro matrix and the remap at Rz90 the device-frame
+ * projection must still reduce to the raw-axis reference mapping.
+ */
+static void test_remap_keeps_projection(void)
+{
+	struct lg_magic_airmouse_state state = make_gravity_state();
+	s64 remap[3][3];
+	s16 gyro[3] = { 2000, 0, 3000 };
+	s16 up[3] = { 0, 0, -41 };
+	s16 mouse[2];
+
+	make_rz90_scaled(state.gyro_matrix, GYRO_SCALE);
+	make_rz90(state.accel_matrix);
+	state.accel_matrix_valid = 1;
+	make_rz90(remap);
+	lgmagic_airmouse_set_remap(&state, remap);
+
+	lgmagic_calc_mouse_gravity(&state, gyro, up, mouse);
+
+	CHECK(mouse[0] > 0);	/* raw z */
+	CHECK(mouse[1] > 0);	/* raw x */
+}
+
+static void test_auto_bias_converges(void)
+{
+	struct lg_magic_airmouse_state state = make_state();
+	s16 gyro[3] = { 100, -100, 50 };
+	s16 mouse[2];
+	int i;
+
+	state.auto_bias = 1;
+	state.bias_beta = q16(0.5);
+	state.zero_rate = q16(1000.0);
+
+	for (i = 0; i < 40; i++)
+		lgmagic_calc_mouse(&state, gyro, mouse);
+
+	CHECK(llabs(state.gyro_bias[0] - q16(100.0)) < 2);
+	CHECK(llabs(state.gyro_bias[1] - q16(-100.0)) < 2);
+	CHECK(llabs(state.gyro_bias[2] - q16(50.0)) < 2);
 }
 
 static void put_le32(u8 *p, u32 v)
@@ -79,128 +536,12 @@ static void write_scd_matrix(u8 *scd, size_t first_float,
 	int i, j;
 
 	for (i = 0; i < 3; i++)
-	{
 		for (j = 0; j < 3; j++)
 		{
 			size_t at = base + (first_float + 3 * i + j) * 4;
 
 			put_float(scd + at, (float)m[i][j]);
 		}
-	}
-}
-
-static void test_accel_gravity_direction(void)
-{
-	struct lg_magic_airmouse_state state = make_state();
-	s16 gyro[3] = { 0, 0, 0 };
-	s16 accel[3] = { 0, 0, -41 };
-	s16 mouse[2];
-
-	/* Raw path used by the blob-only calibration. */
-	state.gravity_valid = 0;
-	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
-	CHECK(llabs(state.gravity[0]) < 8);
-	CHECK(llabs(state.gravity[1]) < 8);
-	CHECK(llabs(state.gravity[2] + LGMAGIC_FP_ONE) < 8);
-
-	/* SCD remap path. */
-	state = make_state();
-	mat_rz90(state.accel_matrix);
-	state.accel_matrix_valid = 1;
-	state.gravity_valid = 0;
-	accel[0] = 41;
-	accel[2] = 0;
-	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
-	CHECK(llabs(state.gravity[0]) < 8);
-	CHECK(llabs(state.gravity[1] - LGMAGIC_FP_ONE) < 8);
-	CHECK(llabs(state.gravity[2]) < 8);
-}
-
-static void test_gravity_projection(void)
-{
-	static const double angles[] = { 0.0, 45.0, 90.0, 135.0, -90.0 };
-	const double pi = 3.14159265358979323846;
-	s64 pointing[3] = { 0, LGMAGIC_FP_ONE, 0 };
-	s64 gravity0[3] = { 0, 0, -LGMAGIC_FP_ONE };
-	s64 omega0[3] = { 0, LGMAGIC_FP_ONE, 0 };
-	s64 yaw, pitch;
-
-	/* A roll about the pointing axis must not move the cursor. */
-	CHECK(lgmagic_project(omega0, gravity0, pointing, &yaw, &pitch) == 0);
-	CHECK(llabs(yaw) < 8);
-	CHECK(llabs(pitch) < 8);
-
-	/* A physical yaw about the world vertical is roll invariant. */
-	for (unsigned int i = 0; i < sizeof(angles) / sizeof(angles[0]); i++)
-	{
-		double a = angles[i] * pi / 180.0;
-		s64 gravity[3] = { q16(-sin(a)), 0, q16(-cos(a)) };
-		s64 omega[3] = { gravity[0], gravity[1], gravity[2] };
-
-		CHECK(lgmagic_project(omega, gravity, pointing,
-				      &yaw, &pitch) == 0);
-		CHECK(llabs(yaw - LGMAGIC_FP_ONE) < 16);
-		CHECK(llabs(pitch) < 16);
-	}
-}
-
-static void test_cursor_sign_matches_kernel_convention(void)
-{
-	struct lg_magic_airmouse_state state = make_state();
-	s16 gyro[3] = { 2, 0, 3 };
-	s16 accel[3] = { 0, 0, -41 };
-	s16 mouse[2];
-
-	state.gravity_alpha = 0;
-
-	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
-	CHECK(mouse[0] == 3);	/* +omega_z */
-	CHECK(mouse[1] == 2);	/* +omega_x */
-}
-
-static void test_remap_rotates_pointing_and_keeps_projection(void)
-{
-	struct lg_magic_airmouse_state state = make_state();
-	s64 remap[3][3];
-	s16 gyro[3] = { 2, 0, 3 };
-	s16 accel[3] = { 0, 0, -41 };
-	s16 mouse[2];
-
-	mat_rz90(state.gyro_matrix);
-	mat_rz90(state.accel_matrix);
-	state.accel_matrix_valid = 1;
-	mat_rz90(remap);
-	lgmagic_airmouse_set_remap(&state, remap);
-
-	CHECK(llabs(state.pointing[0] + LGMAGIC_FP_ONE) < 8);
-	CHECK(llabs(state.pointing[1]) < 8);
-	CHECK(llabs(state.pointing[2]) < 8);
-
-	state.gravity_alpha = 0;
-	lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
-	CHECK(mouse[0] == 3);
-	CHECK(mouse[1] == 2);
-}
-
-static void test_auto_bias_converges(void)
-{
-	struct lg_magic_airmouse_state state = make_state();
-	s16 gyro[3] = { 100, -100, 50 };
-	s16 accel[3] = { 0, 0, -41 };
-	s16 mouse[2];
-	int i;
-
-	state.auto_bias = 1;
-	state.bias_beta = q16(0.5);
-	state.zero_rate = q16(1000.0);
-	state.gravity_alpha = 0;
-
-	for (i = 0; i < 40; i++)
-		lgmagic_calc_mouse_gravity(&state, gyro, accel, mouse);
-
-	CHECK(llabs(state.gyro_bias[0] - q16(100.0)) < 2);
-	CHECK(llabs(state.gyro_bias[1] - q16(-100.0)) < 2);
-	CHECK(llabs(state.gyro_bias[2] - q16(50.0)) < 2);
 }
 
 static void test_scd_matrix_validation(void)
@@ -429,10 +770,15 @@ static void test_phys_calib_parse(void)
 
 int main(void)
 {
-	test_accel_gravity_direction();
-	test_gravity_projection();
-	test_cursor_sign_matches_kernel_convention();
-	test_remap_rotates_pointing_and_keeps_projection();
+	test_baseline_axes_and_signs();
+	test_gravity_projection_matches_baseline();
+	test_gravity_seed_and_recovery();
+	test_gravity_fast_learning_until_settled();
+	test_gravity_fallback_before_seed();
+	test_fallback_basis_uses_remap();
+	test_accel_up_vector_uses_matrix();
+	test_gravity_projection_is_tilt_invariant();
+	test_remap_keeps_projection();
 	test_auto_bias_converges();
 	test_scd_matrix_validation();
 	test_scd_independent_remaps();
